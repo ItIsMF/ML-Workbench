@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ML Workbench · 本机工作台</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<aside class="sidebar">
+ <div class="brand"><span class="brand-mark">M<span>↗</span></span><div>ML Workbench<small>LOCAL RESEARCH DESK</small></div></div>
+ <div class="sidebar-section"><span>项目与任务</span><button id="add-task" class="icon-button" aria-label="添加任务">＋</button></div>
+ <div id="tasks" class="tasks"></div>
+ <button id="add-demo" class="quiet">＋ 添加 CPU 演示</button>
+ <div class="sidebar-foot"><span class="dot"></span> 本机 · 单用户<small>任务由你启动，过程保持可见。</small></div>
+</aside>
+<main>
+ <header><div><div class="eyebrow">EXECUTION / OBSERVATION</div><h1>运行工作台</h1><p>看清每个阶段，保留每次尝试。</p></div><div class="connection" id="connection">连接中…</div></header>
+ <div id="notice" role="status" hidden></div>
+ <section id="task-card" class="card task-card"></section>
+ <div class="workspace">
+  <div class="main-column">
+   <section class="card overview"><div class="section-head"><h2>执行概览</h2><span id="attempt-label" class="muted">尚未选择</span></div><div id="summary"></div><div id="actions" class="actions"></div><div id="stages" class="stages"></div></section>
+   <section class="card"><div class="section-head"><div><h2>指标趋势</h2><span class="muted">保留最近 1,000 个已上报点 / 指标</span></div><select id="metric" aria-label="选择指标"></select></div><div class="chart-wrap"><canvas id="chart" aria-label="指标趋势图"></canvas><div id="chart-empty" class="chart-empty">任务上报指标后，曲线会出现在这里。</div></div><div id="metric-value" class="metric-caption"></div></section>
+   <section class="card"><div class="section-head"><h2>运行日志</h2><span id="log-size" class="muted">stdout / stderr · 显示最近 49,152 字符</span></div><pre id="log" tabindex="0">选择一次执行以查看日志。</pre><details><summary>执行器诊断</summary><pre id="worker-log"></pre></details></section>
+   <section class="card"><div class="section-head"><h2>产物</h2><span class="muted">按需查看 · 原位保留</span></div><div id="artifacts" class="artifacts"><p class="empty">尚无登记产物。</p></div></section>
+  </div>
+  <aside class="history card"><div class="section-head"><h2>执行记录</h2><span id="run-count" class="muted">0</span></div><div id="history"></div><p class="history-note">恢复产生新尝试，保留原记录。这里的完成状态表示进程退出，不代表研究目标达成。</p></aside>
+ </div>
+ <footer>ML Workbench / 独立任务管理</footer>
+</main>
+<dialog id="task-dialog">
+ <form id="task-form">
+  <div class="section-head"><div><div class="eyebrow">TASK DEFINITION</div><h2 id="form-title">添加任务</h2></div><button type="button" id="close-dialog" class="icon-button" aria-label="关闭">×</button></div>
+  <input id="task-id" type="hidden">
+  <div class="form-grid"><label>项目名称<input id="project" required placeholder="例如 Terrain Research"></label><label>任务名称<input id="name" required placeholder="例如 新方法 · 重复 1"></label></div>
+  <label>分组<select id="task-group"><option value="">未分组</option><option value="preflight">前检</option><option value="formal">正式实验</option></select></label>
+  <div class="form-grid"><label>类型<select id="kind"><option value="experiment">实验</option><option value="training">训练</option><option value="inference">推理</option><option value="demo">演示</option></select></label><label>工作目录<input id="cwd" required placeholder="现有目录的完整路径"></label></div>
+  <label>启动命令 · JSON 参数数组<textarea id="argv" required rows="3" placeholder='["C:\\Python\\python.exe", "-u", "train.py"]'></textarea></label>
+  <label>恢复命令 · JSON 参数数组，可留空<textarea id="resume-argv" rows="2" placeholder='["C:\\Python\\python.exe", "-u", "train.py", "--resume"]'></textarea></label>
+  <label>产物根目录 · 可留空<input id="artifact-root" placeholder="留空使用工作台分配的运行工作区"></label>
+  <label class="checkbox"><input id="cooperative" type="checkbox"> 脚本支持工作台协作停止协议</label>
+  <p class="muted">工作台按参数数组直接启动程序。任务保持自己的 Python 环境；不会自动安装依赖。已有运行保留原始配置。</p>
+  <p id="form-error" role="alert"></p><button class="primary" type="submit">保存任务</button>
+ </form>
+</dialog>
+<script src="/app.js"></script>
+</body></html>

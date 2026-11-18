@@ -1,0 +1,11 @@
+.venv/
+data/
+.qa/
+__pycache__/
+*.pyc
+.vscode/
+
+# Local environment files
+.env
+.env.*
+!.env.example
