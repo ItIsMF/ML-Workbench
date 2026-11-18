@@ -12,6 +12,16 @@
 <main>
  <header><div><div class="eyebrow">EXECUTION / OBSERVATION</div><h1>运行工作台</h1><p>看清每个阶段，保留每次尝试。</p></div><div class="connection" id="connection">连接中…</div></header>
  <div id="notice" role="status" hidden></div>
+ <details id="gpu-panel" class="card gpu-card">
+  <summary><strong>GPU 性能</strong><span class="muted">整卡观测 · GPU 0</span></summary>
+  <p>整卡包括桌面和其他进程。打开面板只读记录，不会启动采样。</p>
+  <div class="actions gpu-actions"><button id="gpu-trend" type="button">开始趋势采样</button><button id="gpu-stop" type="button" hidden>停止趋势</button><label>指标集 <select id="gpu-set"><option value="">设备默认</option><option value="gb20x-top">GB20x · 显存 GB/s 与 Tensor</option><option value="gb20x">GB20x · SM 活跃率</option></select></label><button id="gpu-counters" type="button">采集 10 秒硬件短窗</button></div>
+  <p class="muted">趋势每 5 秒一次，最长 30 分钟。硬件短窗按需采集（100 Hz）；本机 GB205 要看显存 GB/s，请选 GB20x 带宽指标集。</p>
+  <p id="gpu-status" role="status"></p>
+  <div class="section-head gpu-records"><label>采集记录 <select id="gpu-record" aria-label="GPU 采集记录"></select></label><button id="gpu-reload" type="button">刷新记录</button></div>
+  <div id="gpu-result" aria-live="polite"></div>
+  <details><summary>权限与保留期限</summary><p>普通工作台可直接读取已有报告。若短窗提示权限不足，只在管理员终端进入工作台目录运行下方命令，再刷新记录。无需提权整个工作台或训练。</p><code id="gpu-command"></code><p>面板新建的原始记录在 14 天后清理；达到 512 MiB 时暂停新增硬件短窗。命令行和实验已有文件不参与清理。</p></details>
+ </details>
  <section id="task-card" class="card task-card"></section>
  <div class="workspace">
   <div class="main-column">
@@ -39,5 +49,5 @@
   <p id="form-error" role="alert"></p><button class="primary" type="submit">保存任务</button>
  </form>
 </dialog>
-<script src="/app.js"></script>
+<script src="/app.js"></script><script src="/gpu.js"></script>
 </body></html>

@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 import uuid
 from monitor import Monitor, read_chunk
+from gpu_panel import GpuPanel
 
 ROOT = Path(__file__).resolve().parent
 ACTIVE = ('starting', 'running', 'stopping')
@@ -275,6 +276,7 @@ def make_server(data, port=8765):
     initialize(data)
     token = secrets.token_urlsafe(32)
     monitor = Monitor(data)
+    gpu = GpuPanel(data)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -307,6 +309,10 @@ def make_server(data, port=8765):
             try:
                 if url.path == '/api/state':
                     return self.respond(dict(state(data), token=token))
+                if url.path == '/api/gpu':
+                    return self.respond(gpu.status())
+                if url.path == '/api/gpu/record':
+                    return self.respond(gpu.read(query.get('id', [''])[0]))
                 if url.path == '/api/view':
                     return self.respond(view_preferences(data))
                 if len(parts) == 4 and parts[:2] == ['api', 'attempt']:
@@ -333,12 +339,12 @@ def make_server(data, port=8765):
                             self.end_headers()
                             while chunk := stream.read(65536): self.wfile.write(chunk)
                         return
-                static = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}
+                static = {'/': 'index.html', '/app.js': 'app.js', '/gpu.js': 'gpu.js', '/style.css': 'style.css'}
                 if url.path in static:
                     file = ROOT / 'web' / static[url.path]
-                    return self.respond(file.read_bytes(), mime={'/': 'text/html', '/app.js': 'text/javascript', '/style.css': 'text/css'}[url.path] + '; charset=utf-8')
+                    return self.respond(file.read_bytes(), mime={'/': 'text/html', '/app.js': 'text/javascript', '/gpu.js': 'text/javascript', '/style.css': 'text/css'}[url.path] + '; charset=utf-8')
                 self.respond({'error': 'Not found'}, 404)
-            except (ValueError, OSError) as error:
+            except (ValueError, OSError, sqlite3.Error) as error:
                 self.respond({'error': str(error)}, 400)
 
         def do_POST(self):
@@ -351,6 +357,12 @@ def make_server(data, port=8765):
                     raise ValueError('需要不超过 256 KiB 的 JSON 请求')
                 value = json.loads(self.rfile.read(size))
                 if not isinstance(value, dict): raise ValueError('请求必须是对象')
+                if self.path == '/api/gpu/start':
+                    gpu.start(value.get('mode'), value.get('metric_set', ''))
+                    return self.respond({'ok': True})
+                if self.path == '/api/gpu/stop':
+                    gpu.stop()
+                    return self.respond({'ok': True})
                 if self.path == '/api/view':
                     view_preferences(data, value)
                     return self.respond({'ok': True})
@@ -373,7 +385,12 @@ def make_server(data, port=8765):
             except (ValueError, OSError, sqlite3.Error) as error:
                 self.respond({'error': str(error)}, 400)
 
-    return ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    class Server(ThreadingHTTPServer):
+        def server_close(self):
+            gpu.cancel.set()
+            super().server_close()
+
+    return Server(('127.0.0.1', port), Handler)
 
 
 def main():
