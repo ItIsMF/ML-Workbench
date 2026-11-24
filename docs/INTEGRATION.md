@@ -71,3 +71,32 @@ report.artifact('preview.png', '输出预览')
 - 浏览器和 HTTP 服务独立于 worker。Windows worker 拥有任务及子进程树；worker 异常退出时 OS 清理其子进程，服务恢复后标记中断。
 - 只监听回环地址；启动/停止需要来源与令牌校验。这个服务是受信任本机用户工具，不是多租户远程平台。
 - 任务参数和日志可能包含敏感内容，应由项目避免写入秘密。工作台不保存完整环境变量快照。
+
+## 外部运行目录观测（4 文件同步协议）
+
+需要被动观测在本机同步文件夹（例如网络磁盘或桌面同步目录）中产生日志和指标的远端或独立运行时，可在启动工作台时传入一个或多个观测目录：
+
+```powershell
+.\start.ps1 -WatchDir "D:\path\to\sync_runs"
+# 或：workbench.py --watch-dir ... （也可设置环境变量 MLWB_WATCH_DIR，多路径用系统分隔符连接）
+```
+
+每个受观测运行在 `<watch_dir>/<attempt_id>/` 下维护标准目录结构（`attempt_id` 仅使用字母、数字与 `._-`）：
+
+1. `meta.json`：必填 `project`、`name`、`status`（如 `starting` / `running` / `stopping` / `completed` / `failed` / `stopped`）；推荐含 `created`、`started`、`heartbeat`（Unix 秒）、`cooperative_stop`、`kind`、`group`、`source_label` 及可选自由字典 `runtime`。活跃态超出 `--heartbeat-timeout`（默认 180 秒）未更新心跳时界面显示“心跳超时”。
+2. `events.jsonl` 与 `stdout.log`：与本地任务格式完全相同的追加事件流与文本日志，继续享受 `monitor.sqlite` 增量读取。
+3. `stop.request`：界面点击“请求安全停止”后写入的停机请求标志文件（不提供强制终止、远端启动或恢复；外部运行也不占用本机单任务槽）。
+4. `artifacts/`：随任务登记的轻量产物或预览图根目录；工作台只允许下载在 `events.jsonl` 中显式上报过的相对路径，禁止路径穿越。
+
+标准库 `reporter.py` 额外提供了 `ExternalRun` 上下文辅助类，负责原子写 `meta.json`、节流心跳（默认 30 秒一次以减少同步盘小文件写放大）、暴露 `run.reporter` 与 `run.env()`，并在捕获 `SystemExit(75)` 且检测到 `stop.request` 时自动收口为 `stopped`：
+
+```python
+from reporter import ExternalRun
+
+with ExternalRun(watch_dir, project='Demo', name='Remote Train', source_label='Remote GPU') as run:
+    for step in range(total):
+        run.reporter.progress('训练', step + 1, total, {'loss': loss_scalar})
+        if run.reporter.stop_requested():
+            save_checkpoint()
+            raise SystemExit(75)
+```

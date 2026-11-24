@@ -124,8 +124,9 @@ class Monitor:
                 changed = True
             read_bytes = 0
             pending = False
-            folder = self.data / 'attempts' / row['id']
-            for name, filename in (('events', 'events.jsonl'), ('log', 'stdout.log'), ('worker_log', 'worker.log')):
+            folder = Path(row['attempt_dir']) if row.get('attempt_dir') else (self.data / 'attempts' / row['id'])
+            streams = (('events', 'events.jsonl'), ('log', 'stdout.log')) if row.get('external') else (('events', 'events.jsonl'), ('log', 'stdout.log'), ('worker_log', 'worker.log'))
+            for name, filename in streams:
                 path = folder / filename
                 stamp = fingerprint(path)
                 old = cache['files'].get(name)

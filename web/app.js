@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const labels = {starting:'启动中',running:'运行中',stopping:'停止请求中',completed:'正常结束',failed:'失败',stopped:'协作停止',terminated:'强制终止',interrupted:'执行器中断'};
+const labels = {starting:'启动中',running:'运行中',stopping:'停止请求中',lost:'心跳超时',completed:'正常结束',failed:'失败',stopped:'协作停止',terminated:'强制终止',interrupted:'执行器中断'};
 const groupLabels = {preflight:'前检',formal:'正式实验','':'未分组'};
 const active = status => ['starting','running','stopping'].includes(status);
 const badge = status => `<span class="badge ${esc(status)}">${esc(labels[status] || status)}</span>`;
@@ -90,17 +90,23 @@ function renderTaskGroups() {
   const members = tasks.filter(t => (t.group || '') === group);
   if (!members.length) return '';
   const key = JSON.stringify([project,group]);
-  return `<details class="task-group" data-group="${esc(key)}"${view.groups[key] ? ' open' : ''}><summary>${label}<span>${members.length}</span></summary>${members.map(t => `<button class="task-nav ${t.id === taskId ? 'selected' : ''}" data-task="${esc(t.id)}" ${t.id === taskId ? 'aria-current="true"' : ''}>${esc(t.name)}<small>${esc({experiment:'实验',training:'训练',inference:'推理',demo:'演示'}[t.kind])}</small></button>`).join('')}</details>`;
+  return `<details class="task-group" data-group="${esc(key)}"${view.groups[key] ? ' open' : ''}><summary>${label}<span>${members.length}</span></summary>${members.map(t => `<button class="task-nav ${t.id === taskId ? 'selected' : ''}" data-task="${esc(t.id)}" ${t.id === taskId ? 'aria-current="true"' : ''}>${esc(t.name)}<small>${esc({experiment:'实验',training:'训练',inference:'推理',demo:'演示'}[t.kind])}${t.external ? ` · ${esc(t.source_label || '外部')}` : ''}</small></button>`).join('')}</details>`;
  }).join('')}</section>`).join('') || '<p class="empty">添加任务，开始组织你的运行。</p>';
 }
 function render() {
  putHtml('tasks', renderTaskGroups());
  const task = current.tasks.find(t => t.id === taskId);
- const busy = current.attempts.some(a => active(a.status));
- putHtml('task-card', task ? `<div class="task-top"><div><div class="eyebrow">${esc(task.project)} / ${groupLabels[task.group || '']}</div><h2>${esc(task.name)}</h2><div class="task-detail">${esc(task.cwd)}</div></div><div><button data-action="edit">编辑</button> <button class="primary" data-action="start" ${busy ? 'disabled' : ''}>启动新运行 ↗</button></div></div><div class="command">${esc(JSON.stringify(task.argv))}</div>${task.kind === 'demo' ? '<p class="muted">独立 CPU 合成演示，不使用 ML 模型或研究数据。</p>' : ''}` : '<div class="task-top"><div><h2>让下一次运行有迹可循。</h2><p class="muted">登记一个任务，或添加 CPU 演示体验完整流程。</p></div><button class="primary" data-action="add">添加任务</button></div>');
+ const busy = current.attempts.some(a => !a.external && active(a.status));
+ const taskCardHtml = !task
+  ? '<div class="task-top"><div><h2>让下一次运行有迹可循。</h2><p class="muted">登记一个任务，或添加 CPU 演示体验完整流程。</p></div><button class="primary" data-action="add">添加任务</button></div>'
+  : task.external
+   ? `<div class="task-top"><div><div class="eyebrow">${esc(task.project)} / ${groupLabels[task.group || '']} <span class="badge external">外部观测 · ${esc(task.source_label || '外部')}</span></div><h2>${esc(task.name)}</h2><div class="task-detail">同步目录：${esc(task.watch_dir || '')}${task.cwd ? ` · 远端目录：${esc(task.cwd)}` : ''}</div></div><div class="muted">外部/云端运行 · 仅观测与协作停止，不占用本机任务槽</div></div>${task.argv?.length ? `<div class="command">${esc(JSON.stringify(task.argv))}</div>` : ''}`
+   : `<div class="task-top"><div><div class="eyebrow">${esc(task.project)} / ${groupLabels[task.group || '']}</div><h2>${esc(task.name)}</h2><div class="task-detail">${esc(task.cwd)}</div></div><div><button data-action="edit">编辑</button> <button class="primary" data-action="start" ${busy ? 'disabled' : ''}>启动新运行 ↗</button></div></div><div class="command">${esc(JSON.stringify(task.argv))}</div>${task.kind === 'demo' ? '<p class="muted">独立 CPU 合成演示，不使用 ML 模型或研究数据。</p>' : ''}`;
+ putHtml('task-card', taskCardHtml);
  const history = current.attempts.filter(a => !taskId || a.task_id === taskId);
  $('run-count').textContent = history.length;
- putHtml('history', history.map(a => `<button class="history-item ${a.id === attemptId ? 'selected' : ''}" data-attempt="${a.id}"><div class="row"><span>${a.parent ? '恢复尝试' : '新运行'}</span>${badge(a.status)}</div><small>${timeLabel(a.created)}</small><small>${a.id.slice(0,8)} · ${esc(a.spec.name)}</small></button>`).join('') || '<p class="empty">尚无执行记录。</p>');
+ const runLabel = a => a.external ? `${a.parent ? '恢复尝试' : '外部运行'} · ${esc(a.source_label || '外部')}` : (a.parent ? '恢复尝试' : '新运行');
+ putHtml('history', history.map(a => `<button class="history-item ${a.id === attemptId ? 'selected' : ''}" data-attempt="${esc(a.id)}"><div class="row"><span>${runLabel(a)}</span>${badge(a.status)}</div><small>${timeLabel(a.created)}</small><small>${esc(a.id.slice(0,8))} · ${esc(a.spec.name)}</small></button>`).join('') || '<p class="empty">尚无执行记录。</p>');
  const row = selected();
  $('attempt-label').textContent = row ? row.id.slice(0,8) + (outputCache.get(row.id)?.more ? ' · 同步新增记录中' : '') : '尚未选择';
  if (!row) {
@@ -108,9 +114,21 @@ function render() {
   $('actions').replaceChildren(); $('stages').replaceChildren(); drawChart(); return;
  }
  const elapsed = Math.max(0, (row.ended || current.server_time) - (row.started || row.created));
- putHtml('summary', `<div class="stats"><div class="stat"><label>执行状态</label>${badge(row.status)}<small>退出码 ${row.exit_code ?? '—'}</small></div><div class="stat"><label>本次墙钟耗时</label><strong>${duration(elapsed)}</strong><small>含系统休眠时间</small></div><div class="stat"><label>最近事件</label><strong>${lastEvent ? `${Math.max(0,Math.floor(current.server_time-lastEvent))} 秒前` : '尚未上报'}</strong><small>${lastEvent ? timeLabel(lastEvent) : '普通日志仍可查看'}</small></div></div>${row.error ? `<p class="error-text">${esc(row.error)}</p>` : ''}${checkpoint ? `<p class="muted">脚本上报检查点：${esc(checkpoint)}（内容由脚本校验）</p>` : ''}${errors ? `<p class="error-text">有 ${errors} 处事件或指标未能展示（格式无效或超出数量上限）；原始事件仍保留。</p>` : ''}<details><summary>本次实际命令与身份</summary><div class="command">${esc(JSON.stringify(row.parent ? row.spec.resume_argv : row.spec.argv))}\n工作目录：${esc(row.spec.cwd)}\n逻辑运行：${row.run_id}\n前次尝试：${row.parent || '无'}</div></details>`);
- let actions = `<a href="/api/attempt/${row.id}/export" download="attempt-${row.id.slice(0,8)}.json">导出执行记录 ↗</a>`;
- if (active(row.status)) actions = `${row.spec.cooperative_stop ? `<button data-action="stop" ${row.status === 'stopping' ? 'disabled' : ''}>请求安全停止</button>` : ''}<button class="danger" data-action="force">强制终止</button> ` + actions;
+ const rtEntries = row.external && row.runtime ? Object.entries(row.runtime) : [];
+ const rtHtml = rtEntries.length ? `<p class="muted">远端运行信息：${rtEntries.map(([k, v]) => `${esc(k)}=${esc(typeof v === 'object' && v !== null ? JSON.stringify(v) : v)}`).join(' · ')}</p>` : '';
+ const hbText = row.heartbeat ? `${Math.max(0, Math.floor(current.server_time - row.heartbeat))} 秒前（${timeLabel(row.heartbeat)}）` : '尚未上报';
+ const hbHtml = row.external ? `<p class="muted">外部来源：${esc(row.source_label || '外部')} · 最近心跳：${hbText}${row.status === 'lost' ? ` · 超过 ${row.heartbeat_timeout || 180} 秒未更新` : ''}</p>${rtHtml}` : '';
+ const idTitle = row.external ? '本次外部运行身份' : '本次实际命令与身份';
+ const idBody = row.external
+  ? `同步路径：${esc(row.attempt_dir || '')}\n来源：${esc(row.source_label || '外部')}\n远端命令：${esc(JSON.stringify(row.spec.argv || []))}\n远端工作目录：${esc(row.spec.cwd || '')}\n逻辑运行：${esc(row.run_id)}\n前次尝试：${esc(row.parent || '无')}`
+  : `${esc(JSON.stringify(row.parent ? row.spec.resume_argv : row.spec.argv))}\n工作目录：${esc(row.spec.cwd)}\n逻辑运行：${row.run_id}\n前次尝试：${row.parent || '无'}`;
+ putHtml('summary', `<div class="stats"><div class="stat"><label>执行状态</label>${badge(row.status)}<small>退出码 ${row.exit_code ?? '—'}</small></div><div class="stat"><label>本次墙钟耗时</label><strong>${duration(elapsed)}</strong><small>含系统休眠时间</small></div><div class="stat"><label>最近事件</label><strong>${lastEvent ? `${Math.max(0,Math.floor(current.server_time-lastEvent))} 秒前` : '尚未上报'}</strong><small>${lastEvent ? timeLabel(lastEvent) : '普通日志仍可查看'}</small></div></div>${hbHtml}${row.error ? `<p class="error-text">${esc(row.error)}</p>` : ''}${checkpoint ? `<p class="muted">脚本上报检查点：${esc(checkpoint)}（内容由脚本校验）</p>` : ''}${errors ? `<p class="error-text">有 ${errors} 处事件或指标未能展示（格式无效或超出数量上限）；原始事件仍保留。</p>` : ''}<details><summary>${idTitle}</summary><div class="command">${idBody}</div></details>`);
+ let actions = `<a href="/api/attempt/${esc(row.id)}/export" download="attempt-${esc(row.id.slice(0,8))}.json">导出执行记录 ↗</a>`;
+ if (row.external) {
+  if (['starting','running','stopping','lost'].includes(row.status) && row.spec.cooperative_stop) {
+   actions = `<button data-action="stop" ${row.status === 'stopping' ? 'disabled' : ''}>请求安全停止</button> ` + actions;
+  }
+ } else if (active(row.status)) actions = `${row.spec.cooperative_stop ? `<button data-action="stop" ${row.status === 'stopping' ? 'disabled' : ''}>请求安全停止</button>` : ''}<button class="danger" data-action="force">强制终止</button> ` + actions;
  else if (row.spec.resume_argv.length && ['failed','stopped','terminated','interrupted'].includes(row.status) && !current.attempts.some(a => a.parent === row.id)) actions = `<button class="primary" data-action="resume" ${busy ? 'disabled' : ''}>从检查点恢复</button> ` + actions;
  putHtml('actions', actions);
  putHtml('stages', [...stages.values()].map(s => `<div class="stage-row"><span>${esc(s.stage)}</span><div class="track"><progress ${s.total !== null ? `value="${s.done}" max="${s.total || 1}"` : ''} aria-label="${esc(s.stage)}进度"></progress></div><span class="stage-count">${s.done}/${s.total ?? '?'} ${esc(s.unit || '')}</span></div>`).join('') || '<p class="empty">尚无结构化阶段信息；不估算未知进度。</p>');
@@ -155,7 +173,9 @@ async function refresh() {
   const wanted = viewLoaded ? attemptId : view.attempt_id;
   viewLoaded=true;
   selectAttempt(current.attempts.find(a=>a.id===wanted && a.task_id===taskId)?.id || current.attempts.find(a=>a.task_id===taskId)?.id || '');
-  await readOutput(); render(); $('connection').textContent='● 本机已连接';
+  await readOutput(); render();
+  const watchCount = Array.isArray(current.watch_dirs) ? current.watch_dirs.length : 0;
+  $('connection').textContent = watchCount ? `● 本机已连接 · 外部监测 ${watchCount} 目录` : '● 本机已连接';
  } catch(error) { $('connection').textContent='连接中断'; notice(error.message); }
  finally { polling=false; }
 }

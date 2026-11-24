@@ -1,10 +1,13 @@
 """Local, single-user ML task workbench. No third-party dependencies."""
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -20,6 +23,10 @@ from gpu_panel import GpuPanel
 ROOT = Path(__file__).resolve().parent
 ACTIVE = ('starting', 'running', 'stopping')
 RESUMABLE = ('failed', 'stopped', 'terminated', 'interrupted')
+SAFE_ID = re.compile(r'^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+EXTERNAL_STATUSES = ACTIVE + ('completed', 'failed', 'stopped', 'terminated', 'interrupted')
+VALID_KINDS = ('experiment', 'training', 'inference', 'demo')
+VALID_GROUPS = ('', 'preflight', 'formal')
 
 
 class FileLock:
@@ -114,10 +121,10 @@ def validate_task(value):
                 raise ValueError('Windows 请指定 .exe；脚本作为参数传入')
         spec[key] = argv
     spec['kind'] = value.get('kind', 'experiment')
-    if spec['kind'] not in ('experiment', 'training', 'inference', 'demo'):
+    if spec['kind'] not in VALID_KINDS:
         raise ValueError('未知任务类型')
     spec['group'] = value.get('group', '')
-    if spec['group'] not in ('', 'preflight', 'formal'):
+    if spec['group'] not in VALID_GROUPS:
         raise ValueError('分组必须是前检、正式实验或未分组')
     spec['cooperative_stop'] = bool(value.get('cooperative_stop', False))
     artifact_root = value.get('artifact_root', '')
@@ -129,6 +136,164 @@ def validate_task(value):
     return spec
 
 
+def _finite_number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def parse_watch_dirs(values):
+    seen = set()
+    result = []
+    for raw in values or ():
+        text = str(raw).strip()
+        if not text:
+            continue
+        resolved = Path(text).expanduser().resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            result.append(resolved)
+    return tuple(result)
+
+
+def scan_external(watch_dirs, heartbeat_timeout=180.0):
+    ext_attempts = []
+    seen_attempt_ids = set()
+    now = time.time()
+    for idx, wdir in enumerate(watch_dirs):
+        if not wdir.is_dir():
+            continue
+        try:
+            subdirs = sorted((p for p in wdir.iterdir() if p.is_dir()), key=lambda p: p.name)
+        except OSError:
+            continue
+        for sub in subdirs:
+            if not SAFE_ID.fullmatch(sub.name):
+                continue
+            meta_file = sub / 'meta.json'
+            if not meta_file.is_file():
+                continue
+            try:
+                meta = json.loads(meta_file.read_text(encoding='utf-8'))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            project = meta.get('project')
+            name = meta.get('name')
+            raw_status = meta.get('status')
+            if (not isinstance(project, str) or not project.strip()
+                    or not isinstance(name, str) or not name.strip()
+                    or raw_status not in EXTERNAL_STATUSES):
+                continue
+            project = project.strip()
+            name = name.strip()
+            kind = meta.get('kind', 'experiment')
+            if kind not in VALID_KINDS:
+                kind = 'experiment'
+            group = meta.get('group', '')
+            if group not in VALID_GROUPS:
+                group = ''
+            created = _finite_number(meta.get('created'))
+            if created is None:
+                try:
+                    created = meta_file.stat().st_mtime
+                except OSError:
+                    created = now
+            started = _finite_number(meta.get('started'))
+            ended = _finite_number(meta.get('ended'))
+            hb = _finite_number(meta.get('heartbeat'))
+            exit_code = meta.get('exit_code')
+            if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+                exit_code = None
+            error = str(meta.get('error') or '')
+            cooperative_stop = bool(meta.get('cooperative_stop', False))
+
+            attempt_id = f'ext_{sub.name}'
+            if attempt_id in seen_attempt_ids:
+                attempt_id = f'ext_{idx}_{sub.name}'
+            seen_attempt_ids.add(attempt_id)
+
+            raw_tid = meta.get('task_id')
+            if isinstance(raw_tid, str) and SAFE_ID.fullmatch(raw_tid):
+                task_id = f'ext_{raw_tid}'
+            else:
+                task_id = f"ext_{hashlib.sha1(f'{project}\\0{name}'.encode('utf-8')).hexdigest()[:16]}"
+
+            if raw_status in ACTIVE:
+                if hb is not None and (now - hb) > heartbeat_timeout:
+                    derived_status = 'lost'
+                elif (sub / 'stop.request').exists():
+                    derived_status = 'stopping'
+                else:
+                    derived_status = raw_status
+            else:
+                derived_status = raw_status
+
+            runtime = meta.get('runtime')
+            if not isinstance(runtime, dict):
+                runtime = {}
+            source_label = str(meta.get('source_label') or runtime.get('platform') or '外部').strip() or '外部'
+
+            cmd = meta.get('command', [])
+            if isinstance(cmd, list) and all(isinstance(a, str) for a in cmd):
+                argv = cmd
+            elif isinstance(cmd, str) and cmd.strip():
+                argv = [cmd]
+            else:
+                argv = []
+            cwd = meta.get('cwd') if isinstance(meta.get('cwd'), str) and meta.get('cwd').strip() else str(sub)
+            artifacts_root = str((sub / 'artifacts').resolve())
+            spec = {
+                'name': name,
+                'project': project,
+                'cwd': cwd,
+                'argv': argv,
+                'resume_argv': [],
+                'kind': kind,
+                'group': group,
+                'cooperative_stop': cooperative_stop,
+                'artifact_root': artifacts_root,
+            }
+            ext_attempts.append({
+                'id': attempt_id,
+                'run_id': str(meta.get('run_id') or attempt_id),
+                'parent': meta.get('parent') if isinstance(meta.get('parent'), str) else None,
+                'task_id': task_id,
+                'spec': spec,
+                'status': derived_status,
+                'raw_status': raw_status,
+                'created': created,
+                'started': started,
+                'ended': ended,
+                'exit_code': exit_code,
+                'error': error,
+                'pid': None,
+                'external': True,
+                'attempt_dir': str(sub.resolve()),
+                'watch_dir': str(wdir),
+                'heartbeat': hb,
+                'heartbeat_timeout': heartbeat_timeout,
+                'runtime': runtime,
+                'source_label': source_label,
+            })
+
+    ext_attempts.sort(key=lambda r: r['created'], reverse=True)
+    tasks_by_id = {}
+    for row in ext_attempts:
+        tid = row['task_id']
+        if tid not in tasks_by_id:
+            tasks_by_id[tid] = {
+                'id': tid,
+                **row['spec'],
+                'external': True,
+                'source_label': row['source_label'],
+                'watch_dir': row['watch_dir'],
+            }
+    return list(tasks_by_id.values()), ext_attempts
+
+
 def attempt(data, ident):
     with connect(data) as db:
         row = db.execute('SELECT * FROM attempts WHERE id=?', (ident,)).fetchone()
@@ -137,6 +302,16 @@ def attempt(data, ident):
     result = dict(row)
     result['spec'] = json.loads(result['spec'])
     return result
+
+
+def resolve_attempt(data, ident, watch_dirs=(), heartbeat_timeout=180.0):
+    if isinstance(ident, str) and ident.startswith('ext_'):
+        _, ext_attempts = scan_external(watch_dirs, heartbeat_timeout)
+        for row in ext_attempts:
+            if row['id'] == ident:
+                return row
+        raise ValueError('执行记录不存在')
+    return attempt(data, ident)
 
 
 def reconcile(data):
@@ -151,14 +326,16 @@ def reconcile(data):
                            (time.time(), '执行器已退出，未记录正常结束；请检查日志后显式恢复。', row['id']))
 
 
-def state(data):
+def state(data, watch_dirs=(), heartbeat_timeout=180.0):
     reconcile(data)
     with connect(data) as db:
         tasks = [dict(id=row['id'], **json.loads(row['spec'])) for row in db.execute('SELECT * FROM tasks ORDER BY rowid DESC')]
         rows = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY created DESC LIMIT 100')]
     for row in rows:
         row['spec'] = json.loads(row['spec'])
-    return dict(tasks=tasks, attempts=rows, server_time=time.time())
+    ext_tasks, ext_attempts = scan_external(watch_dirs, heartbeat_timeout)
+    all_attempts = sorted(rows + ext_attempts, key=lambda r: r['created'], reverse=True)[:100]
+    return dict(tasks=tasks + ext_tasks, attempts=all_attempts, server_time=time.time(), watch_dirs=[str(p) for p in watch_dirs])
 
 
 def view_preferences(data, value=None):
@@ -194,6 +371,8 @@ def save_task(data, value):
 
 
 def start(data, task_id=None, parent=None):
+    if (isinstance(task_id, str) and task_id.startswith('ext_')) or (isinstance(parent, str) and parent.startswith('ext_')):
+        raise ValueError('外部/云端运行请在远端环境启动或恢复')
     reconcile(data)
     ident = uuid.uuid4().hex
     with connect(data) as db:
@@ -236,7 +415,20 @@ def start(data, task_id=None, parent=None):
     return ident
 
 
-def request_stop(data, ident, force=False):
+def request_stop(data, ident, force=False, watch_dirs=(), heartbeat_timeout=180.0):
+    if isinstance(ident, str) and ident.startswith('ext_'):
+        if force:
+            raise ValueError('外部/云端运行不支持强制终止，请使用协作安全停止或在远端环境停止')
+        row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
+        if row.get('raw_status') not in ACTIVE:
+            raise ValueError('该执行已经结束')
+        if not row['spec'].get('cooperative_stop'):
+            raise ValueError('脚本未声明协作停止能力，请在远端环境停止')
+        (Path(row['attempt_dir']) / 'stop.request').write_text(
+            json.dumps({'requested_at': time.time(), 'source': 'ml-workbench'}, ensure_ascii=False),
+            encoding='utf-8',
+        )
+        return
     reconcile(data)
     row = attempt(data, ident)
     if row['status'] not in ACTIVE:
@@ -249,14 +441,19 @@ def request_stop(data, ident, force=False):
         db.execute("UPDATE attempts SET status='stopping' WHERE id=? AND status IN ('starting','running','stopping')", (ident,))
 
 
-def artifact_path(data, ident, name):
-    row = attempt(data, ident)
-    root = Path(row['spec']['artifact_root'] or data / 'work' / row['run_id']).resolve()
+def artifact_path(data, ident, name, watch_dirs=(), heartbeat_timeout=180.0):
+    row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
+    if row.get('external'):
+        attempt_dir = Path(row['attempt_dir']).resolve()
+        root = (attempt_dir / 'artifacts').resolve()
+        events = attempt_dir / 'events.jsonl'
+    else:
+        root = Path(row['spec']['artifact_root'] or data / 'work' / row['run_id']).resolve()
+        events = data / 'attempts' / ident / 'events.jsonl'
     target = (root / name).resolve()
     if not target.is_relative_to(root) or not target.is_file():
         raise ValueError('产物不存在或超出登记根目录')
     # Only paths explicitly reported by this attempt may be downloaded.
-    events = data / 'attempts' / ident / 'events.jsonl'
     registered = False
     if events.exists():
         with events.open(encoding='utf-8') as stream:
@@ -272,8 +469,9 @@ def artifact_path(data, ident, name):
     return target
 
 
-def make_server(data, port=8765):
+def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
     initialize(data)
+    watch_dirs = parse_watch_dirs(watch_dirs)
     token = secrets.token_urlsafe(32)
     monitor = Monitor(data)
     gpu = GpuPanel(data)
@@ -308,7 +506,7 @@ def make_server(data, port=8765):
             parts = url.path.strip('/').split('/')
             try:
                 if url.path == '/api/state':
-                    return self.respond(dict(state(data), token=token))
+                    return self.respond(dict(state(data, watch_dirs, heartbeat_timeout), token=token))
                 if url.path == '/api/gpu':
                     return self.respond(gpu.status())
                 if url.path == '/api/gpu/record':
@@ -317,8 +515,8 @@ def make_server(data, port=8765):
                     return self.respond(view_preferences(data))
                 if len(parts) == 4 and parts[:2] == ['api', 'attempt']:
                     ident, action = parts[2:]
-                    row = attempt(data, ident)
-                    folder = data / 'attempts' / row['id']
+                    row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
+                    folder = Path(row['attempt_dir']) if row.get('external') else (data / 'attempts' / row['id'])
                     if action == 'monitor':
                         return self.respond(monitor.snapshot(row, int(query.get('since', ['-1'])[0])))
                     if action in ('log', 'events', 'worker-log'):
@@ -327,7 +525,7 @@ def make_server(data, port=8765):
                     if action == 'export':
                         return self.respond(row, attachment=True)
                     if action == 'artifact':
-                        target = artifact_path(data, ident, query.get('path', [''])[0])
+                        target = artifact_path(data, ident, query.get('path', [''])[0], watch_dirs, heartbeat_timeout)
                         # Avoid buffering weights/large output arrays into server RAM.
                         image = target.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
                         with target.open('rb') as stream:
@@ -379,7 +577,7 @@ def make_server(data, port=8765):
                 if self.path == '/api/resume':
                     return self.respond({'id': start(data, parent=value.get('id'))})
                 if self.path == '/api/stop':
-                    request_stop(data, value.get('id'), value.get('force') is True)
+                    request_stop(data, value.get('id'), value.get('force') is True, watch_dirs, heartbeat_timeout)
                     return self.respond({'ok': True})
                 self.respond({'error': 'Not found'}, 404)
             except (ValueError, OSError, sqlite3.Error) as error:
@@ -397,19 +595,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, default=0)
     parser.add_argument('--data', type=Path, default=ROOT / 'data')
+    parser.add_argument('--watch-dir', action='append', type=Path, default=[], help='外部/云端运行同步观测目录（可多次指定）')
+    parser.add_argument('--heartbeat-timeout', type=float, default=180.0, help='外部运行心跳超时判定秒数')
     args = parser.parse_args()
     data = args.data.resolve(); initialize(data)
+    raw_watch = args.watch_dir or [p for p in os.environ.get('MLWB_WATCH_DIR', '').split(os.pathsep) if p.strip()]
+    watch_dirs = parse_watch_dirs(raw_watch)
     try:
         lock = FileLock(data / 'server.lock')
     except OSError:
         parser.error('该数据目录已有工作台服务；请打开已有页面')
     try:
-        server = make_server(data, args.port)
+        server = make_server(data, args.port, watch_dirs=watch_dirs, heartbeat_timeout=args.heartbeat_timeout)
     except OSError as error:
         lock.close()
         parser.error(f'无法绑定本机端口：{error}；使用 --port 0 由系统分配可用端口')
-    (data / 'server.json').write_text(json.dumps({'pid': os.getpid(), 'url': f'http://127.0.0.1:{server.server_port}', 'started': time.time()}), encoding='utf-8')
-    print(f'ML Workbench: http://127.0.0.1:{server.server_port}\nData: {data}\nClosing this server does not stop workers.', flush=True)
+    (data / 'server.json').write_text(json.dumps({'pid': os.getpid(), 'url': f'http://127.0.0.1:{server.server_port}', 'started': time.time(), 'watch_dirs': [str(p) for p in watch_dirs]}), encoding='utf-8')
+    watch_line = f"\nWatch dirs: {', '.join(str(p) for p in watch_dirs)}" if watch_dirs else ''
+    print(f'ML Workbench: http://127.0.0.1:{server.server_port}\nData: {data}{watch_line}\nClosing this server does not stop workers.', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
