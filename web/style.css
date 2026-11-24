@@ -6,4 +6,64 @@
 .gpu-card{margin:0 0 18px}.gpu-card>summary{display:flex;gap:12px;align-items:center;cursor:pointer;color:var(--ink)}.gpu-card>summary:before{content:'▸';color:var(--accent)}.gpu-card[open]>summary:before{content:'▾'}.gpu-card>summary strong{font-size:17px}.gpu-card p{line-height:1.6}.gpu-actions,.gpu-records{flex-wrap:wrap;gap:10px}.gpu-records select{max-width:min(440px,70vw)}.gpu-table{overflow:auto;max-height:320px}.gpu-table table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;white-space:nowrap}.gpu-table td,.gpu-table th{padding:6px 10px;text-align:right;border-bottom:1px solid var(--line)}.gpu-table td:first-child,.gpu-table th:first-child{text-align:left}.gpu-table th{position:sticky;top:0;background:white}.gpu-card code,#gpu-status{white-space:pre-wrap;overflow-wrap:anywhere}
 
 .gpu-trace{margin:8px 0 12px}.gpu-trace svg{width:100%;height:80px;display:block}.gpu-trace path{fill:none;stroke-width:2;vector-effect:non-scaling-stroke}.gpu-trace .gpu-grid{stroke:var(--line);stroke-width:1}.gpu-trace .gpu-busy{stroke:#157a68}.gpu-trace .gpu-mem{stroke:#956117;stroke-dasharray:5 3}.gpu-trace figcaption{font-size:12px}.gpu-trace span{color:#157a68;margin-left:10px}.gpu-trace b{color:#956117;font-weight:500}
-.badge.lost{background:#fce9e4;color:#ac4b3c}.badge.external{background:#e6eef4;color:#275878}
+.badge.lost{background:#fce9e4;color:#ac4b3c}.badge.external{background:#e6eef4;color:#275878}.badge.archived{background:#eef1f0;color:#627370}
+
+.sidebar{padding:24px 16px}
+.sidebar-section{margin:18px 0 10px}
+.tasks{flex:1 1 auto;min-height:0;max-height:none;margin-bottom:12px}
+.sidebar-foot{margin-top:12px;padding-top:14px;border-top:1px solid #ffffff14}
+
+.active-runs{margin-top:14px;padding:8px 10px;border-radius:9px;background:#1a3a40;border:1px solid #2b5458}
+.active-runs-head{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#9fc9be;letter-spacing:.5px;margin-bottom:6px}
+.active-run-item{display:block;width:100%;text-align:left;background:#132c31;border:1px solid #274c51;color:#e3efec;padding:7px 9px;margin:4px 0 0;border-radius:6px}
+.active-run-item:hover,.active-run-item.selected{background:#21464b;border-color:#457675}
+.active-run-title{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;min-width:0}
+.active-run-title span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.active-run-item small{display:block;font-size:11px;color:#9cc0ba;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none;background:#87cbb5}
+.status-dot.running,.status-dot.starting{background:#2fd19f;box-shadow:0 0 0 2px #2fd19f30}
+.status-dot.stopping{background:#e6b05c}
+.status-dot.lost{background:#e06c5c}
+
+.source-filter{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:10px;padding:3px;border-radius:7px;background:#102529;border:1px solid #234347}
+.filter-btn{display:flex;align-items:center;justify-content:center;gap:4px;padding:5px 4px;border-radius:5px;border:1px solid transparent;background:transparent;color:#96b5b0;font-size:11px;white-space:nowrap}
+.filter-btn:hover{background:#1a383c;color:#dbe8e5}
+.filter-btn.active{background:#244b4f;border-color:#3d6b69;color:#fff;font-weight:600}
+
+.task-group{margin-top:4px}
+.project-node{margin-bottom:8px;margin-top:0}
+.project-node>summary,.sub-group>summary,.archive-drawer>summary,.archived-project>summary{display:flex;align-items:center;gap:6px;list-style:none;cursor:pointer;padding:6px 7px;border-radius:6px}
+.project-node>summary::-webkit-details-marker,.sub-group>summary::-webkit-details-marker,.archive-drawer>summary::-webkit-details-marker,.archived-project>summary::-webkit-details-marker{display:none}
+.project-node>summary::before,.sub-group>summary::before,.archive-drawer>summary::before,.archived-project>summary::before{content:'▸';font-size:10px;opacity:.75;flex:none}
+.project-node[open]>summary::before,.sub-group[open]>summary::before,.archive-drawer[open]>summary::before,.archived-project[open]>summary::before{content:'▾'}
+.project-node>summary{color:#dbe8e5;font-size:12px;font-weight:600}
+.project-node>summary:hover,.sub-group>summary:hover,.archive-drawer>summary:hover,.archived-project>summary:hover{background:#1c3b40}
+.summary-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.summary-count{flex:none;color:#8cb0aa;font-size:11px;font-variant-numeric:tabular-nums}
+.mini-action{flex:none;padding:1px 6px;font-size:10px;line-height:1.4;border-radius:4px;background:#1d3f44;border:1px solid #356063;color:#bfd7d3;opacity:.45;transition:opacity .12s,background .12s}
+summary:hover .mini-action,summary:focus-within .mini-action,.mini-action:focus-visible{opacity:1}
+.mini-action:hover{background:#2a565b;color:#fff}
+
+.sub-group{margin:3px 0 4px 8px;padding-left:6px;border-left:1px solid #ffffff16}
+.sub-group>summary{padding:4px 6px;color:#a9c9c2;font-size:12px}
+.task-group .task-nav{padding:7px 10px;margin:2px 0}
+.task-title{display:flex;align-items:center;gap:6px;min-width:0}
+
+.archive-drawer{margin-top:14px;padding-top:8px;border-top:1px dashed #ffffff24}
+.archive-drawer>summary{color:#91abaa;font-size:12px}
+.archived-project{margin:3px 0 4px 6px}
+.archived-project>summary{padding:5px 6px;color:#9eb7b3;font-size:12px}
+.archived-project .task-nav{opacity:.78}
+
+.task-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:none}
+button.connection{font-size:12px}
+button.connection:hover{background:#edf4f1;border-color:#c6dad4}
+.watch-list{display:grid;gap:8px;margin:12px 0 16px}
+.watch-item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:#fafcfb}
+.watch-item code{font-family:Consolas,monospace;font-size:12px;overflow-wrap:anywhere}
+.watch-form-row{display:flex;gap:8px;align-items:center;margin-top:6px}
+.watch-form-row input{margin-top:0;flex:1 1 auto}
+.watch-form-row button{flex:none}
+#watch-error{color:#ad443e;font-size:12px}
+@media(max-width:900px){.tasks{display:block;max-height:45vh;margin-bottom:12px}.task-nav{width:100%;min-width:0}.watch-form-row{flex-direction:column;align-items:stretch}}

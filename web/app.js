@@ -2,12 +2,21 @@
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const labels = {starting:'启动中',running:'运行中',stopping:'停止请求中',lost:'心跳超时',completed:'正常结束',failed:'失败',stopped:'协作停止',terminated:'强制终止',interrupted:'执行器中断'};
-const groupLabels = {preflight:'前检',formal:'正式实验','':'未分组'};
+const liveStatuses = new Set(['starting','running','stopping','lost']);
+const presetGroupOrder = {'前检':0,'正式实验':1,'':99};
+const groupDisplay = raw => {
+ const text = String(raw ?? '').trim();
+ if (text === 'preflight') return '前检';
+ if (text === 'formal') return '正式实验';
+ return text;
+};
 const active = status => ['starting','running','stopping'].includes(status);
+const liveRank = status => (status === 'running' || status === 'starting') ? 3 : status === 'stopping' ? 2 : status === 'lost' ? 1 : 0;
+const dotClass = status => status === 'starting' ? 'running' : status;
 const badge = status => `<span class="badge ${esc(status)}">${esc(labels[status] || status)}</span>`;
 const timeLabel = n => n ? new Date(n * 1000).toLocaleString('zh-CN',{hour12:false}) : '—';
 const duration = n => `${Math.floor(n / 3600)}:${String(Math.floor(n / 60) % 60).padStart(2,'0')}:${String(Math.floor(n) % 60).padStart(2,'0')}`;
-let current = {tasks:[], attempts:[]}, token = '', taskId = '', attemptId = '';
+let current = {tasks:[], attempts:[]}, token = '', taskId = '', attemptId = '', sourceFilter = 'all';
 let view = {groups:{},task_id:'',attempt_id:''}, viewLoaded = false, viewWrite = Promise.resolve();
 const outputCache = new Map();
 let stages = new Map(), metrics = new Map(), artifacts = new Map(), lastEvent = 0, errors = 0, checkpoint = '', polling = false;
@@ -23,9 +32,16 @@ function putHtml(id, html) {
  const element = $(id);
  if (htmlCache.get(id) === html) return;
  htmlCache.set(id, html);
- const expanded = new Map([...element.querySelectorAll('details')].map((d,i) => [d.dataset.group ?? i,d.open]));
+ const expanded = new Map([...element.querySelectorAll('details')].map((d,i) => [d.dataset?.group ?? i,d.open]));
  element.innerHTML = html;
- element.querySelectorAll('details').forEach((d,i) => { d.open = expanded.get(d.dataset.group ?? i) ?? d.open; });
+ element.querySelectorAll('details').forEach((d,i) => {
+  const key = d.dataset?.group;
+  if (key !== undefined && Object.prototype.hasOwnProperty.call(view.groups, key)) {
+   d.open = view.groups[key];
+  } else {
+   d.open = expanded.get(key ?? i) ?? d.open;
+  }
+ });
 }
 function notice(text) { $('notice').textContent = text; $('notice').hidden = !text; }
 function persistView() {
@@ -80,28 +96,207 @@ function selectAttempt(id) {
  rememberSelection();
 }
 
-function renderTaskGroups() {
- const projects = new Map();
- for (const task of current.tasks) {
-  if (!projects.has(task.project)) projects.set(task.project,[]);
-  projects.get(task.project).push(task);
+function classifyTask(task) {
+ const parts = String(task.project || '').split('/').map(s => s.trim()).filter(Boolean);
+ const groupText = groupDisplay(task.group);
+ if (parts.length >= 2) {
+  return {topProject: parts[0], subGroup: parts.slice(1).join(' / '), extraTag: groupText};
  }
- return [...projects].map(([project,tasks]) => `<section class="project-group"><h3>${esc(project)}</h3>${Object.entries(groupLabels).map(([group,label]) => {
-  const members = tasks.filter(t => (t.group || '') === group);
-  if (!members.length) return '';
-  const key = JSON.stringify([project,group]);
-  return `<details class="task-group" data-group="${esc(key)}"${view.groups[key] ? ' open' : ''}><summary>${label}<span>${members.length}</span></summary>${members.map(t => `<button class="task-nav ${t.id === taskId ? 'selected' : ''}" data-task="${esc(t.id)}" ${t.id === taskId ? 'aria-current="true"' : ''}>${esc(t.name)}<small>${esc({experiment:'实验',training:'训练',inference:'推理',demo:'演示'}[t.kind])}${t.external ? ` · ${esc(t.source_label || '外部')}` : ''}</small></button>`).join('')}</details>`;
- }).join('')}</section>`).join('') || '<p class="empty">添加任务，开始组织你的运行。</p>';
+ return {topProject: parts[0] || '未命名项目', subGroup: groupText, extraTag: ''};
+}
+function buildTaskMeta() {
+ const meta = new Map();
+ for (const task of current.tasks) {
+  meta.set(task.id, {
+   latest: null,
+   activeAttempt: null,
+   liveAttempt: null,
+   isLive: false,
+   isActive: false,
+   liveRank: 0,
+   lastActivity: Number.isFinite(task.last_activity) ? task.last_activity : 0,
+   info: classifyTask(task),
+  });
+ }
+ for (const a of current.attempts) {
+  const entry = meta.get(a.task_id);
+  if (!entry) continue;
+  if (!entry.latest || (a.created || 0) > (entry.latest.created || 0)) entry.latest = a;
+  if (active(a.status) && (!entry.activeAttempt || (a.created || 0) > (entry.activeAttempt.created || 0))) {
+   entry.activeAttempt = a;
+  }
+  if ((a.created || 0) > entry.lastActivity) entry.lastActivity = a.created || 0;
+ }
+ for (const entry of meta.values()) {
+  if (entry.activeAttempt) entry.liveAttempt = entry.activeAttempt;
+  else if (entry.latest && entry.latest.status === 'lost') entry.liveAttempt = entry.latest;
+  else entry.liveAttempt = null;
+  entry.liveRank = entry.liveAttempt ? liveRank(entry.liveAttempt.status) : 0;
+  entry.isLive = Boolean(entry.liveAttempt);
+  entry.isActive = Boolean(entry.activeAttempt);
+ }
+ return meta;
+}
+function renderActiveRuns(meta) {
+ const box = $('active-runs');
+ const taskById = new Map(current.tasks.map(t => [t.id, t]));
+ const live = current.attempts.filter(a => {
+  if (taskById.get(a.task_id)?.archived) return false;
+  return active(a.status) || (a.status === 'lost' && meta.get(a.task_id)?.liveAttempt?.id === a.id);
+ }).sort((a, b) => (liveRank(b.status) - liveRank(a.status)) || ((b.created || 0) - (a.created || 0)));
+ if (!live.length) {
+  box.hidden = true;
+  putHtml('active-runs', '');
+  return;
+ }
+ box.hidden = false;
+ const rows = live.map(a => {
+  const task = taskById.get(a.task_id);
+  const info = meta.get(a.task_id)?.info || classifyTask(task || a.spec || {});
+  const name = task?.name || a.spec?.name || a.id.slice(0, 8);
+  const src = (a.external || task?.external) ? (a.source_label || task?.source_label || '外部') : '本机';
+  const sel = (a.task_id === taskId && a.id === attemptId) ? ' selected' : '';
+  return `<button type="button" class="active-run-item${sel}" data-jump-task="${esc(a.task_id)}" data-jump-attempt="${esc(a.id)}"><span class="active-run-title"><span class="status-dot ${esc(dotClass(a.status))}"></span><span>${esc(name)}</span></span><small>${esc(labels[a.status] || a.status)} · ${esc(src)} · ${esc(info.topProject)}</small></button>`;
+ }).join('');
+ putHtml('active-runs', `<div class="active-runs-head"><span>活跃运行</span><span>${live.length}</span></div>${rows}`);
+}
+function renderSourceFilter(meta) {
+ const nonArchived = current.tasks.filter(t => !t.archived);
+ const extTasks = nonArchived.filter(t => Boolean(t.external));
+ const extLiveRank = extTasks.reduce((best, t) => Math.max(best, meta.get(t.id)?.liveRank || 0), 0);
+ const extDot = extLiveRank >= 2 ? 'running' : extLiveRank === 1 ? 'lost' : '';
+ const items = [
+  ['all', `全部 ${nonArchived.length}`, ''],
+  ['local', `本机 ${nonArchived.length - extTasks.length}`, ''],
+  ['external', `外部 ${extTasks.length}`, extDot],
+ ];
+ putHtml('source-filter', items.map(([key, label, dot]) =>
+  `<button type="button" role="tab" aria-selected="${sourceFilter === key}" class="filter-btn${sourceFilter === key ? ' active' : ''}" data-filter="${key}">${dot ? `<span class="status-dot ${dot}"></span>` : ''}${esc(label)}</button>`
+ ).join(''));
+}
+const subgroupRank = label => Object.prototype.hasOwnProperty.call(presetGroupOrder, label) ? presetGroupOrder[label] : 2;
+function taskSubtitle(task, info, entry) {
+ const parts = [];
+ if (info.extraTag) parts.push(info.extraTag);
+ parts.push({experiment:'实验',training:'训练',inference:'推理',demo:'演示'}[task.kind] || task.kind || '任务');
+ if (task.external) parts.push(task.source_label || '外部');
+ if (entry?.isLive) parts.push(labels[entry.liveAttempt.status] || entry.liveAttempt.status);
+ else if (task.external && entry?.latest?.status) parts.push(labels[entry.latest.status] || entry.latest.status);
+ return parts.join(' · ');
+}
+function renderTaskButton(task, info, entry) {
+ const dot = entry?.isLive ? `<span class="status-dot ${esc(dotClass(entry.liveAttempt.status))}"></span>` : '';
+ return `<button class="task-nav ${task.id === taskId ? 'selected' : ''}" data-task="${esc(task.id)}" ${task.id === taskId ? 'aria-current="true"' : ''}><span class="task-title">${dot}<span class="summary-label">${esc(task.name)}</span></span><small>${esc(taskSubtitle(task, info, entry))}</small></button>`;
+}
+function archiveButton(taskIds, archived) {
+ if (!taskIds.length) return '';
+ const label = archived ? '归档' : '恢复';
+ return `<button type="button" class="mini-action" data-action="archive-tasks" data-archived="${archived ? 'true' : 'false'}" data-task-ids="${esc(JSON.stringify(taskIds))}" title="${label}">${label}</button>`;
+}
+function renderTaskGroups(meta = buildTaskMeta()) {
+ const filtered = current.tasks.filter(t => sourceFilter === 'all' ? true : sourceFilter === 'external' ? Boolean(t.external) : !t.external);
+ const activeList = filtered.filter(t => !t.archived);
+ const archivedList = filtered.filter(t => t.archived);
+
+ const projectMap = new Map();
+ activeList.forEach((task, idx) => {
+  const entry = meta.get(task.id) || {isLive: false, isActive: false, liveRank: 0, lastActivity: 0, info: classifyTask(task), liveAttempt: null};
+  const {topProject, subGroup} = entry.info;
+  if (!projectMap.has(topProject)) projectMap.set(topProject, {name: topProject, order: idx, liveRank: 0, liveStatus: '', maxActivity: 0, groups: new Map(), tasks: []});
+  const proj = projectMap.get(topProject);
+  if (entry.liveRank > proj.liveRank) { proj.liveRank = entry.liveRank; proj.liveStatus = entry.liveAttempt.status; }
+  if (entry.lastActivity > proj.maxActivity) proj.maxActivity = entry.lastActivity;
+  proj.tasks.push({task, entry, info: entry.info, order: idx});
+  if (!proj.groups.has(subGroup)) proj.groups.set(subGroup, {name: subGroup, order: idx, liveRank: 0, liveStatus: '', maxActivity: 0, items: []});
+  const grp = proj.groups.get(subGroup);
+  if (entry.liveRank > grp.liveRank) { grp.liveRank = entry.liveRank; grp.liveStatus = entry.liveAttempt.status; }
+  if (entry.lastActivity > grp.maxActivity) grp.maxActivity = entry.lastActivity;
+  grp.items.push({task, entry, info: entry.info, order: idx});
+ });
+
+ const projects = [...projectMap.values()].sort((a, b) =>
+  (b.liveRank - a.liveRank) || (b.maxActivity - a.maxActivity) || (a.order - b.order)
+ );
+
+ const activeHtml = projects.map(proj => {
+  const projKey = JSON.stringify([1, proj.name]);
+  const groups = [...proj.groups.values()].sort((a, b) =>
+   (b.liveRank - a.liveRank) || (b.maxActivity - a.maxActivity) || (subgroupRank(a.name) - subgroupRank(b.name)) || (a.order - b.order)
+  );
+  const flatUnlabeled = groups.length === 1 && groups[0].name === '';
+  let body = '';
+  if (flatUnlabeled) {
+   const sorted = [...groups[0].items].sort((a, b) =>
+    (b.entry.liveRank - a.entry.liveRank) || (b.entry.lastActivity - a.entry.lastActivity) || (a.order - b.order)
+   );
+   body = sorted.map(it => renderTaskButton(it.task, it.info, it.entry)).join('');
+  } else {
+   body = groups.map(grp => {
+    const sorted = [...grp.items].sort((a, b) =>
+     (b.entry.liveRank - a.entry.liveRank) || (b.entry.lastActivity - a.entry.lastActivity) || (a.order - b.order)
+    );
+    const subKey = JSON.stringify([2, proj.name, grp.name]);
+    const archIds = sorted.filter(it => !it.entry.isActive).map(it => it.task.id);
+    const subDot = grp.liveStatus ? `<span class="status-dot ${esc(dotClass(grp.liveStatus))}"></span>` : '';
+    return `<details class="sub-group task-group" data-group="${esc(subKey)}"${view.groups[subKey] ? ' open' : ''}><summary>${subDot}<span class="summary-label">${esc(grp.name || '未分组')}</span>${archiveButton(archIds, true)}<span class="summary-count">${sorted.length}</span></summary>${sorted.map(it => renderTaskButton(it.task, it.info, it.entry)).join('')}</details>`;
+   }).join('');
+  }
+  const projArchIds = proj.tasks.filter(it => !it.entry.isActive).map(it => it.task.id);
+  const projDot = proj.liveStatus ? `<span class="status-dot ${esc(dotClass(proj.liveStatus))}"></span>` : '';
+  return `<details class="project-node task-group" data-group="${esc(projKey)}"${view.groups[projKey] ? ' open' : ''}><summary>${projDot}<span class="summary-label">${esc(proj.name)}</span>${archiveButton(projArchIds, true)}<span class="summary-count">${proj.tasks.length}</span></summary>${body}</details>`;
+ }).join('');
+
+ let archivedHtml = '';
+ if (archivedList.length) {
+  const archMap = new Map();
+  archivedList.forEach((task, idx) => {
+   const entry = meta.get(task.id) || {isLive: false, isActive: false, liveRank: 0, lastActivity: 0, info: classifyTask(task), liveAttempt: null};
+   const topProject = entry.info.topProject;
+   if (!archMap.has(topProject)) archMap.set(topProject, {name: topProject, order: idx, maxActivity: 0, items: []});
+   const bucket = archMap.get(topProject);
+   if (entry.lastActivity > bucket.maxActivity) bucket.maxActivity = entry.lastActivity;
+   bucket.items.push({task, entry, info: entry.info, order: idx});
+  });
+  const archProjects = [...archMap.values()].sort((a, b) => (b.maxActivity - a.maxActivity) || (a.order - b.order));
+  const drawerKey = JSON.stringify([0]);
+  const drawerBody = archProjects.map(bucket => {
+   const apKey = JSON.stringify([3, bucket.name]);
+   const sorted = [...bucket.items].sort((a, b) => (b.entry.lastActivity - a.entry.lastActivity) || (a.order - b.order));
+   return `<details class="archived-project task-group" data-group="${esc(apKey)}"${view.groups[apKey] ? ' open' : ''}><summary><span class="summary-label">${esc(bucket.name)}</span>${archiveButton(sorted.map(it => it.task.id), false)}<span class="summary-count">${sorted.length}</span></summary>${sorted.map(it => renderTaskButton(it.task, it.info, it.entry)).join('')}</details>`;
+  }).join('');
+  archivedHtml = `<details class="archive-drawer task-group" data-group="${esc(drawerKey)}"${view.groups[drawerKey] ? ' open' : ''}><summary><span class="summary-label">已归档</span><span class="summary-count">${archivedList.length}</span></summary>${drawerBody}</details>`;
+ }
+
+ if (!activeHtml && !archivedHtml) {
+  return sourceFilter === 'all' ? '<p class="empty">添加任务，开始组织你的运行。</p>' : '<p class="empty">当前来源筛选下暂无任务。</p>';
+ }
+ return activeHtml + archivedHtml;
 }
 function render() {
- putHtml('tasks', renderTaskGroups());
+ const meta = buildTaskMeta();
+ renderActiveRuns(meta);
+ renderSourceFilter(meta);
+ putHtml('tasks', renderTaskGroups(meta));
  const task = current.tasks.find(t => t.id === taskId);
+ const taskEntry = task ? meta.get(task.id) : null;
  const busy = current.attempts.some(a => !a.external && active(a.status));
- const taskCardHtml = !task
-  ? '<div class="task-top"><div><h2>让下一次运行有迹可循。</h2><p class="muted">登记一个任务，或添加 CPU 演示体验完整流程。</p></div><button class="primary" data-action="add">添加任务</button></div>'
-  : task.external
-   ? `<div class="task-top"><div><div class="eyebrow">${esc(task.project)} / ${groupLabels[task.group || '']} <span class="badge external">外部观测 · ${esc(task.source_label || '外部')}</span></div><h2>${esc(task.name)}</h2><div class="task-detail">同步目录：${esc(task.watch_dir || '')}${task.cwd ? ` · 远端目录：${esc(task.cwd)}` : ''}</div></div><div class="muted">外部/云端运行 · 仅观测与协作停止，不占用本机任务槽</div></div>${task.argv?.length ? `<div class="command">${esc(JSON.stringify(task.argv))}</div>` : ''}`
-   : `<div class="task-top"><div><div class="eyebrow">${esc(task.project)} / ${groupLabels[task.group || '']}</div><h2>${esc(task.name)}</h2><div class="task-detail">${esc(task.cwd)}</div></div><div><button data-action="edit">编辑</button> <button class="primary" data-action="start" ${busy ? 'disabled' : ''}>启动新运行 ↗</button></div></div><div class="command">${esc(JSON.stringify(task.argv))}</div>${task.kind === 'demo' ? '<p class="muted">独立 CPU 合成演示，不使用 ML 模型或研究数据。</p>' : ''}`;
+ let taskCardHtml = '';
+ if (!task) {
+  taskCardHtml = '<div class="task-top"><div><h2>让下一次运行有迹可循。</h2><p class="muted">登记一个任务，或添加 CPU 演示体验完整流程。</p></div><button class="primary" data-action="add">添加任务</button></div>';
+ } else {
+  const {topProject, subGroup, extraTag} = taskEntry?.info || classifyTask(task);
+  const archBtnLabel = task.archived ? '取消归档' : '归档';
+  const archDisabled = !task.archived && taskEntry?.isActive ? 'disabled' : '';
+  const archBtn = `<button type="button" data-action="archive-tasks" data-archived="${task.archived ? 'false' : 'true'}" data-task-ids="${esc(JSON.stringify([task.id]))}" ${archDisabled}>${archBtnLabel}</button>`;
+  const archBadge = task.archived ? ' <span class="badge archived">已归档</span>' : '';
+  const extraCrumb = extraTag ? ` · ${esc(extraTag)}` : '';
+  const crumb = `${esc(topProject)} / ${esc(subGroup || '未分组')}${extraCrumb}`;
+  if (task.external) {
+   taskCardHtml = `<div class="task-top"><div><div class="eyebrow">${crumb} <span class="badge external">外部观测 · ${esc(task.source_label || '外部')}</span>${archBadge}</div><h2>${esc(task.name)}</h2><div class="task-detail">同步目录：${esc(task.watch_dir || '')}${task.cwd ? ` · 远端目录：${esc(task.cwd)}` : ''}</div></div><div class="task-actions">${archBtn}</div></div><p class="muted">外部/云端运行 · 仅观测与协作停止，不占用本机任务槽</p>${task.argv?.length ? `<div class="command">${esc(JSON.stringify(task.argv))}</div>` : ''}`;
+  } else {
+   taskCardHtml = `<div class="task-top"><div><div class="eyebrow">${crumb}${archBadge}</div><h2>${esc(task.name)}</h2><div class="task-detail">${esc(task.cwd)}</div></div><div class="task-actions">${archBtn} <button data-action="edit">编辑</button> <button class="primary" data-action="start" ${busy ? 'disabled' : ''}>启动新运行 ↗</button></div></div><div class="command">${esc(JSON.stringify(task.argv))}</div>${task.kind === 'demo' ? '<p class="muted">独立 CPU 合成演示，不使用 ML 模型或研究数据。</p>' : ''}`;
+  }
+ }
  putHtml('task-card', taskCardHtml);
  const history = current.attempts.filter(a => !taskId || a.task_id === taskId);
  $('run-count').textContent = history.length;
@@ -164,30 +359,67 @@ function drawChart() {
  ctx.fillStyle='#84938e';ctx.textAlign='left';ctx.fillText('0 s',left,h-7);ctx.textAlign='right';ctx.fillText(`${(last.t-minT).toFixed(1)} s`,w-right,h-7);
  $('metric-value').textContent = `最新 ${last.v.toPrecision(5)} · ${points.length} 个已上报点 · 横轴为显示窗口内时间`;
 }
+function renderWatchList() {
+ const dirs = Array.isArray(current.watch_dirs) ? current.watch_dirs : [];
+ putHtml('watch-list', dirs.map(d =>
+  `<div class="watch-item"><code>${esc(d)}</code><button type="button" class="danger" data-action="remove-watch" data-watch-path="${esc(d)}">移除</button></div>`
+ ).join('') || '<p class="empty">尚未配置外部观测目录。</p>');
+}
 async function refresh() {
  if (polling) return; polling=true;
  try {
   current = await api('/api/state'); token=current.token;
   if (!viewLoaded) { view=await api('/api/view'); taskId=view.task_id; }
-  if (!current.tasks.some(t=>t.id===taskId)) taskId=current.tasks[0]?.id || '';
+  if (!current.tasks.some(t=>t.id===taskId)) {
+   const visibleIds = new Set(current.tasks.filter(t => !t.archived).map(t => t.id));
+   const live = current.attempts.find(a => visibleIds.has(a.task_id) && liveStatuses.has(a.status));
+   taskId = live?.task_id || current.tasks.find(t => !t.archived)?.id || current.tasks[0]?.id || '';
+  }
   const wanted = viewLoaded ? attemptId : view.attempt_id;
   viewLoaded=true;
   selectAttempt(current.attempts.find(a=>a.id===wanted && a.task_id===taskId)?.id || current.attempts.find(a=>a.task_id===taskId)?.id || '');
   await readOutput(); render();
+  if ($('watch-dialog').open) renderWatchList();
   const watchCount = Array.isArray(current.watch_dirs) ? current.watch_dirs.length : 0;
   $('connection').textContent = watchCount ? `● 本机已连接 · 外部监测 ${watchCount} 目录` : '● 本机已连接';
  } catch(error) { $('connection').textContent='连接中断'; notice(error.message); }
  finally { polling=false; }
 }
 function openForm(task) {
+ const projects = [], groups = ['前检', '正式实验'];
+ const seenP = new Set(), seenG = new Set(groups);
+ for (const t of current.tasks) {
+  const {topProject, subGroup} = classifyTask(t);
+  const rawProj = String(t.project || '').trim();
+  for (const p of [topProject, rawProj]) {
+   if (p && !seenP.has(p)) { seenP.add(p); projects.push(p); }
+  }
+  const g = groupDisplay(t.group) || subGroup;
+  if (g && !seenG.has(g)) { seenG.add(g); groups.push(g); }
+ }
+ putHtml('project-suggestions', projects.map(p => `<option value="${esc(p)}"></option>`).join(''));
+ putHtml('group-suggestions', groups.map(g => `<option value="${esc(g)}"></option>`).join(''));
  $('task-id').value=task?.id || ''; $('project').value=task?.project || ''; $('name').value=task?.name || '';
  $('cwd').value=task?.cwd || ''; $('kind').value=task?.kind || 'experiment';
  $('task-group').value=task?.group || '';
- $('argv').value=task ? JSON.stringify(task.argv,null,2) : ''; $('resume-argv').value=task?.resume_argv.length ? JSON.stringify(task.resume_argv,null,2) : '';
+ $('argv').value=task ? JSON.stringify(task.argv,null,2) : ''; $('resume-argv').value=task?.resume_argv?.length ? JSON.stringify(task.resume_argv,null,2) : '';
  $('artifact-root').value=task?.artifact_root || ''; $('cooperative').checked=task?.cooperative_stop || false;
  $('form-error').textContent=''; $('form-title').textContent=task ? '编辑任务定义' : '添加任务'; $('task-dialog').showModal();
 }
 $('add-task').onclick=()=>openForm(); $('close-dialog').onclick=()=>$('task-dialog').close();
+$('connection').onclick=()=>{renderWatchList();$('watch-error').textContent='';$('watch-dialog').showModal();};
+$('close-watch-dialog').onclick=()=>$('watch-dialog').close();
+$('watch-form').onsubmit=async event=>{
+ event.preventDefault();
+ try {
+  const nextPath=$('watch-input').value.trim();
+  const dirs=[...(Array.isArray(current.watch_dirs)?current.watch_dirs:[])];
+  if (nextPath && !dirs.includes(nextPath)) dirs.push(nextPath);
+  await api('/api/watch-dirs',{watch_dirs:dirs});
+  $('watch-input').value=''; $('watch-error').textContent='';
+  await refresh(); renderWatchList();
+ } catch(error) { $('watch-error').textContent=error.message; }
+};
 $('add-demo').onclick=async()=>{try {const value=await api('/api/demo',{});taskId=value.id;selectAttempt('');notice('已添加 CPU 演示。点击“启动新运行”后才会执行。');await refresh();}catch(error){notice(error.message);}};
 $('task-form').onsubmit=async event=>{
  event.preventDefault();
@@ -198,7 +430,7 @@ $('task-form').onsubmit=async event=>{
 };
 document.addEventListener('toggle',event=>{
  const group=event.target;
- if (!viewLoaded || !group.isConnected || !group.matches('details.task-group')) return;
+ if (!viewLoaded || !group.isConnected || !group.matches('details[data-group]')) return;
  const key=group.dataset.group;
  if ((view.groups[key] || false) === group.open) return;
  view.groups[key]=group.open;
@@ -206,9 +438,61 @@ document.addEventListener('toggle',event=>{
 },true);
 document.addEventListener('click',async event=>{
  const button=event.target.closest('button'); if (!button) return;
+ if (button.dataset.filter) {
+  sourceFilter = button.dataset.filter;
+  render();
+  return;
+ }
+ if (button.dataset.jumpTask) {
+  const jTask = button.dataset.jumpTask;
+  const jAttempt = button.dataset.jumpAttempt || '';
+  if (sourceFilter !== 'all') sourceFilter = 'all';
+  const target = current.tasks.find(t => t.id === jTask);
+  if (target) {
+   const info = classifyTask(target);
+   const keys = [JSON.stringify([1, info.topProject])];
+   const hasNamedSub = current.tasks.some(t => !t.archived && classifyTask(t).topProject === info.topProject && classifyTask(t).subGroup);
+   if (info.subGroup || hasNamedSub) keys.push(JSON.stringify([2, info.topProject, info.subGroup || '']));
+   if (target.archived) keys.push(JSON.stringify([0]), JSON.stringify([3, info.topProject]));
+   let changed = false;
+   for (const k of keys) {
+    if (!view.groups[k]) { view.groups[k] = true; changed = true; }
+   }
+   if (changed && viewLoaded) persistView();
+  }
+  taskId = jTask;
+  selectAttempt(jAttempt || current.attempts.find(a => a.task_id === jTask)?.id || '');
+  await refresh();
+  return;
+ }
  if (button.dataset.task) {taskId=button.dataset.task;selectAttempt(current.attempts.find(a=>a.task_id===taskId)?.id || '');render();await refresh();return;}
  if (button.dataset.attempt) {selectAttempt(button.dataset.attempt);await refresh();return;}
  const action=button.dataset.action; if (!action) return;
+ if (action==='archive-tasks') {
+  event.preventDefault();
+  event.stopPropagation();
+  button.disabled=true;
+  try {
+   const taskIds=JSON.parse(button.dataset.taskIds || '[]');
+   const archived=button.dataset.archived === 'true';
+   await api('/api/archive',{task_ids:taskIds,archived});
+   notice('');await refresh();
+  } catch(error) { notice(error.message); }
+  finally {button.disabled=false;}
+  return;
+ }
+ if (action==='remove-watch') {
+  button.disabled=true;
+  try {
+   const target=button.dataset.watchPath || '';
+   const dirs=(Array.isArray(current.watch_dirs)?current.watch_dirs:[]).filter(d=>d!==target);
+   await api('/api/watch-dirs',{watch_dirs:dirs});
+   $('watch-error').textContent='';
+   await refresh(); renderWatchList();
+  } catch(error) { $('watch-error').textContent=error.message; }
+  finally {button.disabled=false;}
+  return;
+ }
  try {
   if (action==='add') return openForm();
   if (action==='edit') return openForm(current.tasks.find(t=>t.id===taskId));

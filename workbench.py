@@ -26,7 +26,20 @@ RESUMABLE = ('failed', 'stopped', 'terminated', 'interrupted')
 SAFE_ID = re.compile(r'^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
 EXTERNAL_STATUSES = ACTIVE + ('completed', 'failed', 'stopped', 'terminated', 'interrupted')
 VALID_KINDS = ('experiment', 'training', 'inference', 'demo')
-VALID_GROUPS = ('', 'preflight', 'formal')
+MAX_GROUP_LEN = 80
+
+
+def normalize_group(value, strict=True):
+    if not isinstance(value, str):
+        if strict:
+            raise ValueError('分组必须是字符串')
+        return ''
+    text = value.strip()
+    if '\0' in text or len(text) > MAX_GROUP_LEN:
+        if strict:
+            raise ValueError(f'分组名称不能包含空字符或超过 {MAX_GROUP_LEN} 个字符')
+        return ''
+    return text
 
 
 class FileLock:
@@ -123,9 +136,7 @@ def validate_task(value):
     spec['kind'] = value.get('kind', 'experiment')
     if spec['kind'] not in VALID_KINDS:
         raise ValueError('未知任务类型')
-    spec['group'] = value.get('group', '')
-    if spec['group'] not in VALID_GROUPS:
-        raise ValueError('分组必须是前检、正式实验或未分组')
+    spec['group'] = normalize_group(value.get('group', ''), strict=True)
     spec['cooperative_stop'] = bool(value.get('cooperative_stop', False))
     artifact_root = value.get('artifact_root', '')
     if not isinstance(artifact_root, str):
@@ -192,9 +203,7 @@ def scan_external(watch_dirs, heartbeat_timeout=180.0):
             kind = meta.get('kind', 'experiment')
             if kind not in VALID_KINDS:
                 kind = 'experiment'
-            group = meta.get('group', '')
-            if group not in VALID_GROUPS:
-                group = ''
+            group = normalize_group(meta.get('group', ''), strict=False)
             created = _finite_number(meta.get('created'))
             if created is None:
                 try:
@@ -222,7 +231,8 @@ def scan_external(watch_dirs, heartbeat_timeout=180.0):
                 task_id = f"ext_{hashlib.sha1(f'{project}\\0{name}'.encode('utf-8')).hexdigest()[:16]}"
 
             if raw_status in ACTIVE:
-                if hb is not None and (now - hb) > heartbeat_timeout:
+                hb_ref = hb if hb is not None else created
+                if (now - hb_ref) > heartbeat_timeout:
                     derived_status = 'lost'
                 elif (sub / 'stop.request').exists():
                     derived_status = 'stopping'
@@ -280,6 +290,14 @@ def scan_external(watch_dirs, heartbeat_timeout=180.0):
             })
 
     ext_attempts.sort(key=lambda r: r['created'], reverse=True)
+    seen_tasks = set()
+    for row in ext_attempts:
+        tid = row['task_id']
+        if tid in seen_tasks and row['status'] == 'lost':
+            row['status'] = 'interrupted'
+            row['ended'] = row['ended'] or row['heartbeat'] or row['created']
+            row['error'] = row['error'] or '远端会话中断，已由后续尝试接续。'
+        seen_tasks.add(tid)
     tasks_by_id = {}
     for row in ext_attempts:
         tid = row['task_id']
@@ -326,14 +344,154 @@ def reconcile(data):
                            (time.time(), '执行器已退出，未记录正常结束；请检查日志后显式恢复。', row['id']))
 
 
+def _read_pref_list(db, key):
+    row = db.execute('SELECT value FROM preferences WHERE key=?', (key,)).fetchone()
+    if not row:
+        return []
+    try:
+        items = json.loads(row['value'])
+    except (ValueError, TypeError):
+        return []
+    return [x for x in items if isinstance(x, str) and x] if isinstance(items, list) else []
+
+
+def _read_archived(db):
+    return set(_read_pref_list(db, 'archived'))
+
+
+def _read_watch_dirs(db):
+    return parse_watch_dirs(_read_pref_list(db, 'watch_dirs'))
+
+
+def saved_watch_dirs(data):
+    with connect(data) as db:
+        return _read_watch_dirs(db)
+
+
+def _sync_server_json_watch_dirs(data, watch_list):
+    sfile = Path(data) / 'server.json'
+    if not sfile.is_file():
+        return
+    try:
+        info = json.loads(sfile.read_text(encoding='utf-8'))
+        if isinstance(info, dict) and info.get('pid') == os.getpid():
+            info['watch_dirs'] = watch_list
+            sfile.write_text(json.dumps(info), encoding='utf-8')
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def set_watch_dirs(data, dirs, *, require_existing=True):
+    if not isinstance(dirs, list) or len(dirs) > 20:
+        raise ValueError('watch_dirs 必须是最多 20 项的目录列表')
+    validated = []
+    for raw in dirs:
+        if not isinstance(raw, str):
+            raise ValueError('观测目录必须是字符串路径')
+        text = raw.strip()
+        if not text or '\0' in text or len(text) > 500:
+            raise ValueError('观测目录路径无效或过长')
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError('观测目录必须是现有的绝对目录')
+        resolved = candidate.resolve()
+        if require_existing and not resolved.is_dir():
+            raise ValueError('观测目录必须是现有的绝对目录')
+        validated.append(resolved)
+    normalized = parse_watch_dirs(validated)
+    watch_list = [str(p) for p in normalized]
+    with connect(data) as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('INSERT INTO preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   ('watch_dirs', json.dumps(watch_list, ensure_ascii=False)))
+    _sync_server_json_watch_dirs(data, watch_list)
+    return {'ok': True, 'watch_dirs': watch_list}
+
+
+def _merge_watch_dirs(data, extra_dirs):
+    extra = parse_watch_dirs(extra_dirs)
+    if not extra:
+        return saved_watch_dirs(data)
+    with connect(data) as db:
+        db.execute('BEGIN IMMEDIATE')
+        merged = parse_watch_dirs(list(_read_watch_dirs(db)) + list(extra))
+        watch_list = [str(p) for p in merged]
+        db.execute('INSERT INTO preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   ('watch_dirs', json.dumps(watch_list, ensure_ascii=False)))
+    return merged
+
+
+def archived_task_ids(data):
+    with connect(data) as db:
+        return _read_archived(db)
+
+
+def set_archived(data, task_ids, archived, watch_dirs=(), heartbeat_timeout=180.0):
+    if not isinstance(task_ids, list) or not (1 <= len(task_ids) <= 500):
+        raise ValueError('task_ids 必须是包含 1 至 500 个任务标识的数组')
+    cleaned = []
+    for item in task_ids:
+        if not isinstance(item, str) or not item.strip() or '\0' in item or len(item) > 120:
+            raise ValueError('无效任务标识')
+        cleaned.append(item)
+    if type(archived) is not bool:
+        raise ValueError('archived 必须是布尔值')
+
+    active_ext = set()
+    if archived:
+        reconcile(data)
+        _, ext_attempts = scan_external(watch_dirs, heartbeat_timeout)
+        active_ext = {row['task_id'] for row in ext_attempts if row['status'] in ACTIVE}
+        if any(tid in active_ext for tid in cleaned):
+            raise ValueError('不能归档正在运行的任务')
+
+    with connect(data) as db:
+        db.execute('BEGIN IMMEDIATE')
+        if archived:
+            active_local = {
+                row['task_id']
+                for row in db.execute("SELECT DISTINCT task_id FROM attempts WHERE status IN ('starting','running','stopping')").fetchall()
+            }
+            if any(tid in active_local for tid in cleaned):
+                raise ValueError('不能归档正在运行的任务')
+        current = _read_archived(db)
+        if archived:
+            current.update(cleaned)
+        else:
+            current.difference_update(cleaned)
+        ordered = sorted(current)
+        db.execute('INSERT INTO preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   ('archived', json.dumps(ordered, ensure_ascii=False)))
+    return {'ok': True, 'archived': ordered}
+
+
 def state(data, watch_dirs=(), heartbeat_timeout=180.0):
     reconcile(data)
     with connect(data) as db:
         tasks = [dict(id=row['id'], **json.loads(row['spec'])) for row in db.execute('SELECT * FROM tasks ORDER BY rowid DESC')]
         rows = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY created DESC LIMIT 100')]
+        activity_rows = db.execute('SELECT task_id, MAX(created) AS last_created FROM attempts GROUP BY task_id').fetchall()
+        archived = _read_archived(db)
+    local_activity = {r['task_id']: float(r['last_created'] or 0.0) for r in activity_rows}
     for row in rows:
         row['spec'] = json.loads(row['spec'])
     ext_tasks, ext_attempts = scan_external(watch_dirs, heartbeat_timeout)
+    ext_activity = {}
+    for row in ext_attempts:
+        tid = row['task_id']
+        created = float(row.get('created') or 0.0)
+        if created > ext_activity.get(tid, 0.0):
+            ext_activity[tid] = created
+    active_ids = (
+        {r['task_id'] for r in rows if r['status'] in ACTIVE}
+        | {r['task_id'] for r in ext_attempts if r['status'] in ACTIVE}
+    )
+    for task in tasks:
+        task['archived'] = (task['id'] in archived) and (task['id'] not in active_ids)
+        task['last_activity'] = local_activity.get(task['id'], 0.0)
+    for task in ext_tasks:
+        task['archived'] = (task['id'] in archived) and (task['id'] not in active_ids)
+        task['last_activity'] = ext_activity.get(task['id'], 0.0)
     all_attempts = sorted(rows + ext_attempts, key=lambda r: r['created'], reverse=True)[:100]
     return dict(tasks=tasks + ext_tasks, attempts=all_attempts, server_time=time.time(), watch_dirs=[str(p) for p in watch_dirs])
 
@@ -420,7 +578,7 @@ def request_stop(data, ident, force=False, watch_dirs=(), heartbeat_timeout=180.
         if force:
             raise ValueError('外部/云端运行不支持强制终止，请使用协作安全停止或在远端环境停止')
         row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
-        if row.get('raw_status') not in ACTIVE:
+        if row.get('status') not in ACTIVE and row.get('status') != 'lost':
             raise ValueError('该执行已经结束')
         if not row['spec'].get('cooperative_stop'):
             raise ValueError('脚本未声明协作停止能力，请在远端环境停止')
@@ -469,9 +627,10 @@ def artifact_path(data, ident, name, watch_dirs=(), heartbeat_timeout=180.0):
     return target
 
 
-def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
+def make_server(data, port=8765, watch_dirs=None, heartbeat_timeout=180.0):
     initialize(data)
-    watch_dirs = parse_watch_dirs(watch_dirs)
+    if watch_dirs:
+        _merge_watch_dirs(data, watch_dirs)
     token = secrets.token_urlsafe(32)
     monitor = Monitor(data)
     gpu = GpuPanel(data)
@@ -504,9 +663,10 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
                 return self.respond({'error': 'Host rejected'}, 403)
             url = urlsplit(self.path); query = parse_qs(url.query)
             parts = url.path.strip('/').split('/')
+            active_watch = saved_watch_dirs(data)
             try:
                 if url.path == '/api/state':
-                    return self.respond(dict(state(data, watch_dirs, heartbeat_timeout), token=token))
+                    return self.respond(dict(state(data, active_watch, heartbeat_timeout), token=token))
                 if url.path == '/api/gpu':
                     return self.respond(gpu.status())
                 if url.path == '/api/gpu/record':
@@ -515,7 +675,7 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
                     return self.respond(view_preferences(data))
                 if len(parts) == 4 and parts[:2] == ['api', 'attempt']:
                     ident, action = parts[2:]
-                    row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
+                    row = resolve_attempt(data, ident, active_watch, heartbeat_timeout)
                     folder = Path(row['attempt_dir']) if row.get('external') else (data / 'attempts' / row['id'])
                     if action == 'monitor':
                         return self.respond(monitor.snapshot(row, int(query.get('since', ['-1'])[0])))
@@ -525,7 +685,7 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
                     if action == 'export':
                         return self.respond(row, attachment=True)
                     if action == 'artifact':
-                        target = artifact_path(data, ident, query.get('path', [''])[0], watch_dirs, heartbeat_timeout)
+                        target = artifact_path(data, ident, query.get('path', [''])[0], active_watch, heartbeat_timeout)
                         # Avoid buffering weights/large output arrays into server RAM.
                         image = target.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif')
                         with target.open('rb') as stream:
@@ -549,6 +709,7 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
             origin = self.headers.get('Origin')
             if not self.valid_host() or self.headers.get('X-MLWB-Token') != token or (origin and origin != 'http://' + self.headers['Host']):
                 return self.respond({'error': '请求来源或令牌无效'}, 403)
+            active_watch = saved_watch_dirs(data)
             try:
                 size = int(self.headers.get('Content-Length', '0'))
                 if size <= 0 or size > 262144 or self.headers.get('Content-Type') != 'application/json':
@@ -564,6 +725,8 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
                 if self.path == '/api/view':
                     view_preferences(data, value)
                     return self.respond({'ok': True})
+                if self.path == '/api/watch-dirs':
+                    return self.respond(set_watch_dirs(data, value.get('watch_dirs')))
                 if self.path == '/api/tasks':
                     return self.respond({'id': save_task(data, value)})
                 if self.path == '/api/demo':
@@ -577,8 +740,10 @@ def make_server(data, port=8765, watch_dirs=(), heartbeat_timeout=180.0):
                 if self.path == '/api/resume':
                     return self.respond({'id': start(data, parent=value.get('id'))})
                 if self.path == '/api/stop':
-                    request_stop(data, value.get('id'), value.get('force') is True, watch_dirs, heartbeat_timeout)
+                    request_stop(data, value.get('id'), value.get('force') is True, active_watch, heartbeat_timeout)
                     return self.respond({'ok': True})
+                if self.path == '/api/archive':
+                    return self.respond(set_archived(data, value.get('task_ids'), value.get('archived'), active_watch, heartbeat_timeout))
                 self.respond({'error': 'Not found'}, 404)
             except (ValueError, OSError, sqlite3.Error) as error:
                 self.respond({'error': str(error)}, 400)
@@ -600,18 +765,19 @@ def main():
     args = parser.parse_args()
     data = args.data.resolve(); initialize(data)
     raw_watch = args.watch_dir or [p for p in os.environ.get('MLWB_WATCH_DIR', '').split(os.pathsep) if p.strip()]
-    watch_dirs = parse_watch_dirs(raw_watch)
+    cli_watch = parse_watch_dirs(raw_watch)
     try:
         lock = FileLock(data / 'server.lock')
     except OSError:
         parser.error('该数据目录已有工作台服务；请打开已有页面')
     try:
-        server = make_server(data, args.port, watch_dirs=watch_dirs, heartbeat_timeout=args.heartbeat_timeout)
+        server = make_server(data, args.port, watch_dirs=cli_watch, heartbeat_timeout=args.heartbeat_timeout)
     except OSError as error:
         lock.close()
         parser.error(f'无法绑定本机端口：{error}；使用 --port 0 由系统分配可用端口')
-    (data / 'server.json').write_text(json.dumps({'pid': os.getpid(), 'url': f'http://127.0.0.1:{server.server_port}', 'started': time.time(), 'watch_dirs': [str(p) for p in watch_dirs]}), encoding='utf-8')
-    watch_line = f"\nWatch dirs: {', '.join(str(p) for p in watch_dirs)}" if watch_dirs else ''
+    effective_watch = saved_watch_dirs(data)
+    (data / 'server.json').write_text(json.dumps({'pid': os.getpid(), 'url': f'http://127.0.0.1:{server.server_port}', 'started': time.time(), 'watch_dirs': [str(p) for p in effective_watch]}), encoding='utf-8')
+    watch_line = f"\nWatch dirs: {', '.join(str(p) for p in effective_watch)}" if effective_watch else ''
     print(f'ML Workbench: http://127.0.0.1:{server.server_port}\nData: {data}{watch_line}\nClosing this server does not stop workers.', flush=True)
     try:
         server.serve_forever()

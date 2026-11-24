@@ -76,6 +76,9 @@ const run = code => vm.runInContext(code, scope);
  await run('refresh()');
  assert.equal(element('connection').textContent, '● 本机已连接 · 外部监测 1 目录');
  assert.match(element('tasks').innerHTML, /Colab A100/);
+ assert.equal(element('active-runs').hidden, false);
+ assert.match(element('active-runs').innerHTML, /Remote Train.*Lost Train/);
+ assert.match(element('source-filter').innerHTML, /全部 3.*本机 1.*外部 2/);
 
  // Running external attempt must NOT lock local start or resume buttons.
  assert.match(element('task-card').innerHTML, /data-action="start" >/);
@@ -94,11 +97,20 @@ const run = code => vm.runInContext(code, scope);
  assert.ok(element('summary').innerHTML.includes('&lt;img src=x onerror=alert(1)&gt;'));
  assert.ok(!element('summary').innerHTML.includes('<img src=x onerror=alert(1)>'));
 
- // Heartbeat-timeout external run renders 'lost' badge and still allows cooperative stop only.
+ // Heartbeat-timeout external run renders 'lost' badge, allows cooperative stop only, and permits archiving.
  run("taskId = 'ext_t2'; selectAttempt('ext_lost1')");
  assert.match(element('summary').innerHTML, /class="badge lost">心跳超时</);
+ assert.match(element('task-card').innerHTML, /data-action="archive-tasks" data-archived="true"[^>]*>归档</);
+ assert.ok(!/data-action="archive-tasks"[^>]*disabled/.test(element('task-card').innerHTML));
  assert.match(element('actions').innerHTML, /data-action="stop"/);
  assert.ok(!element('actions').innerHTML.includes('data-action="force"'));
+
+ // Archiving the lost external task removes it from #active-runs; replacing it with a newer completed attempt surfaces 正常结束 cleanly.
+ run("current.tasks=current.tasks.map(t=>t.id==='ext_t2'?{...t,archived:true}:t);render()");
+ assert.ok(!element('active-runs').innerHTML.includes('Lost Train'));
+ run("current.tasks=current.tasks.map(t=>t.id==='ext_t2'?{...t,archived:false}:t);current.attempts.unshift({id:'ext_done2',run_id:'ext_done2',parent:null,task_id:'ext_t2',status:'completed',created:10020,started:10010,ended:10020,exit_code:0,error:'',external:true,source_label:'Cloud',runtime:{},spec:current.tasks[2]});render()");
+ assert.ok(!element('active-runs').innerHTML.includes('Lost Train'));
+ assert.match(element('tasks').innerHTML, /实验 · Cloud · 正常结束/);
 
  console.log('External UI checks passed: independent local slot, read-only external task card, cooperative-only stop, lost badge, runtime escaping.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

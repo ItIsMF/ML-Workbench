@@ -115,27 +115,76 @@ class WorkbenchTests(unittest.TestCase):
         task = self.request('/api/tasks', spec)['id']
         ident = self.request('/api/start', {'task_id': task})['id']
         original = self.finished(ident)
-        # Reclassifying a task must not change its completed attempt or logs.
+        # Reclassifying a task (including free-text groups) must not change completed attempts or logs.
         events = (self.data/'attempts'/ident/'events.jsonl').read_bytes()
-        spec.update(id=task, group='formal')
-        self.request('/api/tasks', spec)
-        self.assertEqual(self.request('/api/state')['tasks'][0]['group'], 'formal')
+        for custom in ('formal', 'Route Process', '  阶段一 · 探索  '):
+            spec.update(id=task, group=custom)
+            self.request('/api/tasks', spec)
+            self.assertEqual(self.request('/api/state')['tasks'][0]['group'], custom.strip())
         self.assertEqual(wb.attempt(self.data, ident), original)
         self.assertEqual((self.data/'attempts'/ident/'events.jsonl').read_bytes(), events)
         wb.initialize(self.data)
-        self.assertEqual(wb.state(self.data)['tasks'][0]['group'], 'formal')
+        self.assertEqual(wb.state(self.data)['tasks'][0]['group'], '阶段一 · 探索')
         del spec['group']
         self.request('/api/tasks', spec)
-        self.assertEqual(wb.state(self.data)['tasks'][0]['group'], 'formal')
-        # Legacy definitions still work, but an explicit empty value clears grouping.
+        self.assertEqual(wb.state(self.data)['tasks'][0]['group'], '阶段一 · 探索')
+        # An explicit empty value clears grouping; invalid types or overlong text are rejected.
         self.request('/api/tasks', dict(spec, group=''))
         self.assertEqual(wb.state(self.data)['tasks'][0]['group'], '')
-        for invalid in ('unknown', None, []):
+        for invalid in (None, [], 123, 'bad\0group', 'x' * 81):
             with self.assertRaises(urllib.error.HTTPError) as rejected:
                 self.request('/api/tasks', dict(spec, group=invalid))
             self.assertEqual(rejected.exception.code, 400)
         legacy = self.request('/api/tasks', self.spec())['id']
         self.assertEqual(next(t for t in wb.state(self.data)['tasks'] if t['id'] == legacy)['group'], '')
+
+    def test_archive_tasks_lifecycle_and_active_protection(self):
+        t1 = self.request('/api/tasks', dict(self.spec(), name='Done Task'))['id']
+        a1 = self.request('/api/start', {'task_id': t1})['id']
+        original = self.finished(a1)
+        state1 = self.request('/api/state')
+        row1 = next(t for t in state1['tasks'] if t['id'] == t1)
+        self.assertFalse(row1['archived'])
+        self.assertGreater(row1['last_activity'], 0)
+
+        # Active local task must reject archiving; completed task must archive and survive restart.
+        t2 = self.request('/api/tasks', dict(self.spec(), name='Active Task'))['id']
+        a2 = self.request('/api/start', {'task_id': t2})['id']
+        wait_for(lambda: (self.data/'work'/a2/'checkpoint.json').exists())
+
+        with self.assertRaises(urllib.error.HTTPError) as active_err:
+            self.request('/api/archive', {'task_ids': [t2], 'archived': True})
+        self.assertEqual(active_err.exception.code, 400)
+
+        for bad_payload, bad_headers, code in (
+            ({'task_ids': [], 'archived': True}, {}, 400),
+            ({'task_ids': [t1], 'archived': 'yes'}, {}, 400),
+            ({'task_ids': [t1], 'archived': True}, {'X-MLWB-Token': 'wrong'}, 403),
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                self.request('/api/archive', bad_payload, **bad_headers)
+            self.assertEqual(err.exception.code, code)
+
+        res = self.request('/api/archive', {'task_ids': [t1], 'archived': True})
+        self.assertEqual(res['archived'], [t1])
+        self.assertTrue(next(t for t in self.request('/api/state')['tasks'] if t['id'] == t1)['archived'])
+        self.assertEqual(wb.attempt(self.data, a1), original)
+
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        self.server = wb.make_server(self.data, 0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.url = f'http://127.0.0.1:{self.server.server_port}'
+        self.token = self.request('/api/state')['token']
+        self.assertTrue(next(t for t in self.request('/api/state')['tasks'] if t['id'] == t1)['archived'])
+
+        self.finished(a2)
+        self.request('/api/archive', {'task_ids': [t1, t2], 'archived': True})
+        tasks_after = {t['id']: t['archived'] for t in self.request('/api/state')['tasks']}
+        self.assertEqual(tasks_after, {t1: True, t2: True})
+
+        self.request('/api/archive', {'task_ids': [t1], 'archived': False})
+        tasks_final = {t['id']: t['archived'] for t in self.request('/api/state')['tasks']}
+        self.assertEqual(tasks_final, {t1: False, t2: True})
 
     def test_failure_exit_and_launch_failure_are_visible(self):
         task = wb.save_task(self.data, self.spec([sys.executable,'-c','raise RuntimeError("QA failure")']))
