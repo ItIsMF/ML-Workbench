@@ -112,5 +112,13 @@ const run = code => vm.runInContext(code, scope);
  assert.ok(!element('active-runs').innerHTML.includes('Lost Train'));
  assert.match(element('tasks').innerHTML, /实验 · Cloud · 正常结束/);
 
- console.log('External UI checks passed: independent local slot, read-only external task card, cooperative-only stop, lost badge, runtime escaping.');
+ // Archive-ready external attempt renders '拉取到本地' -> after fetch renders '重新校验拉取' and escaped receipt in #summary.
+ run("taskId='ext_t2';selectAttempt('ext_done2');current.attempts[0].archive_available=true;current.project_roots={'Geo':'D:/Projects/Geo'};render()");
+ assert.match(element('actions').innerHTML, /data-action="fetch-run"[^>]*>拉取到本地</);
+ assert.match(element('actions').innerHTML, /data-action="bind-fetch-root"[^>]*>拉取目录…</);
+ run("current.attempts[0].fetched={dest:'D:/Projects/<Geo>',source_out_rel:'results/out',file_count:5,fetched_at:10010};render()");
+ assert.match(element('actions').innerHTML, /data-action="fetch-run"[^>]*>重新校验拉取</);
+ assert.ok(element('summary').innerHTML.includes('本地已拉取：D:/Projects/&lt;Geo&gt; → results/out · 5 文件'));
+
+ console.log('External UI checks passed: independent local slot, read-only external task card, cooperative-only stop, lost badge, runtime escaping, fetch controls.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

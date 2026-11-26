@@ -60,5 +60,15 @@
   <p class="muted">目录会持久保存在工作台本地数据库中，添加或移除后立即生效，无需重启。</p>
  </form>
 </dialog>
+<dialog id="fetch-dialog">
+ <form id="fetch-form">
+  <div class="section-head"><div><div class="eyebrow">LOCAL DESTINATION</div><h2 id="fetch-dialog-title">绑定本地项目根目录</h2></div><button type="button" id="close-fetch-dialog" class="icon-button" aria-label="关闭">×</button></div>
+  <p class="muted" id="fetch-project-label"></p>
+  <label>本地项目根目录 · 绝对路径<input id="fetch-root-input" required placeholder="例如 D:\Projects\MyProject\Backend"></label>
+  <p class="muted" id="fetch-hint"></p>
+  <p id="fetch-error" role="alert"></p>
+  <button class="primary" type="submit" id="fetch-submit">保存并拉取</button>
+ </form>
+</dialog>
 <script src="/app.js"></script><script src="/gpu.js"></script>
 </body></html>

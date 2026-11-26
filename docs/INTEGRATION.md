@@ -88,6 +88,8 @@ report.artifact('preview.png', '输出预览')
 3. `stop.request`：界面点击“请求安全停止”后写入的停机请求标志文件（不提供强制终止、远端启动或恢复；外部运行也不占用本机单任务槽）。
 4. `artifacts/`：随任务登记的轻量产物或预览图根目录；工作台只允许下载在 `events.jsonl` 中显式上报过的相对路径，禁止路径穿越。
 
+若外部 runner 在 `<watch_dir>` 上级目录的 `runs/` 下伴随写入标准 `.manifest.json`（含 `tar_name`、`tar_sha256`、`tar_bytes`、`source_out_rel` 与逐文件 `path`/`sha256` 列表）及 `.tar` 归档包（可在 `meta.json` `runtime.archive_manifest` 声明相对路径），工作台会在界面显示 **“拉取到本地”** 按钮：首次按项目名称绑定并持久保存本地根目录，拉取时严格校验归档包与逐文件 SHA256，一致文件自动跳过，遇本地修改冲突先提示确认后再覆盖。
+
 标准库 `reporter.py` 额外提供了 `ExternalRun` 上下文辅助类，负责原子写 `meta.json`、节流心跳（默认 30 秒一次以减少同步盘小文件写放大）、暴露 `run.reporter` 与 `run.env()`，并在捕获 `SystemExit(75)` 且检测到 `stop.request` 时自动收口为 `stopped`：
 
 ```python

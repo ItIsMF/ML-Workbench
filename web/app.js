@@ -16,9 +16,11 @@ const dotClass = status => status === 'starting' ? 'running' : status;
 const badge = status => `<span class="badge ${esc(status)}">${esc(labels[status] || status)}</span>`;
 const timeLabel = n => n ? new Date(n * 1000).toLocaleString('zh-CN',{hour12:false}) : '—';
 const duration = n => `${Math.floor(n / 3600)}:${String(Math.floor(n / 60) % 60).padStart(2,'0')}:${String(Math.floor(n) % 60).padStart(2,'0')}`;
-let current = {tasks:[], attempts:[]}, token = '', taskId = '', attemptId = '', sourceFilter = 'all';
+let current = {tasks:[], attempts:[], project_roots:{}}, token = '', taskId = '', attemptId = '', sourceFilter = 'all';
 let view = {groups:{},task_id:'',attempt_id:''}, viewLoaded = false, viewWrite = Promise.resolve();
 const outputCache = new Map();
+const fetchingIds = new Set();
+let pendingFetch = null;
 let stages = new Map(), metrics = new Map(), artifacts = new Map(), lastEvent = 0, errors = 0, checkpoint = '', polling = false;
 
 async function api(path, value, keepalive=false) {
@@ -312,7 +314,10 @@ function render() {
  const rtEntries = row.external && row.runtime ? Object.entries(row.runtime) : [];
  const rtHtml = rtEntries.length ? `<p class="muted">远端运行信息：${rtEntries.map(([k, v]) => `${esc(k)}=${esc(typeof v === 'object' && v !== null ? JSON.stringify(v) : v)}`).join(' · ')}</p>` : '';
  const hbText = row.heartbeat ? `${Math.max(0, Math.floor(current.server_time - row.heartbeat))} 秒前（${timeLabel(row.heartbeat)}）` : '尚未上报';
- const hbHtml = row.external ? `<p class="muted">外部来源：${esc(row.source_label || '外部')} · 最近心跳：${hbText}${row.status === 'lost' ? ` · 超过 ${row.heartbeat_timeout || 180} 秒未更新` : ''}</p>${rtHtml}` : '';
+ const fetchedHtml = row.external && row.fetched
+  ? `<p class="muted">本地已拉取：${esc(row.fetched.dest)}${row.fetched.source_out_rel ? ` → ${esc(row.fetched.source_out_rel)}` : ''} · ${row.fetched.file_count} 文件 · ${timeLabel(row.fetched.fetched_at)}</p>`
+  : '';
+ const hbHtml = row.external ? `<p class="muted">外部来源：${esc(row.source_label || '外部')} · 最近心跳：${hbText}${row.status === 'lost' ? ` · 超过 ${row.heartbeat_timeout || 180} 秒未更新` : ''}</p>${rtHtml}${fetchedHtml}` : '';
  const idTitle = row.external ? '本次外部运行身份' : '本次实际命令与身份';
  const idBody = row.external
   ? `同步路径：${esc(row.attempt_dir || '')}\n来源：${esc(row.source_label || '外部')}\n远端命令：${esc(JSON.stringify(row.spec.argv || []))}\n远端工作目录：${esc(row.spec.cwd || '')}\n逻辑运行：${esc(row.run_id)}\n前次尝试：${esc(row.parent || '无')}`
@@ -320,6 +325,13 @@ function render() {
  putHtml('summary', `<div class="stats"><div class="stat"><label>执行状态</label>${badge(row.status)}<small>退出码 ${row.exit_code ?? '—'}</small></div><div class="stat"><label>本次墙钟耗时</label><strong>${duration(elapsed)}</strong><small>含系统休眠时间</small></div><div class="stat"><label>最近事件</label><strong>${lastEvent ? `${Math.max(0,Math.floor(current.server_time-lastEvent))} 秒前` : '尚未上报'}</strong><small>${lastEvent ? timeLabel(lastEvent) : '普通日志仍可查看'}</small></div></div>${hbHtml}${row.error ? `<p class="error-text">${esc(row.error)}</p>` : ''}${checkpoint ? `<p class="muted">脚本上报检查点：${esc(checkpoint)}（内容由脚本校验）</p>` : ''}${errors ? `<p class="error-text">有 ${errors} 处事件或指标未能展示（格式无效或超出数量上限）；原始事件仍保留。</p>` : ''}<details><summary>${idTitle}</summary><div class="command">${idBody}</div></details>`);
  let actions = `<a href="/api/attempt/${esc(row.id)}/export" download="attempt-${esc(row.id.slice(0,8))}.json">导出执行记录 ↗</a>`;
  if (row.external) {
+  if (row.archive_available) {
+   const isFetching = fetchingIds.has(row.id);
+   const boundRoot = (current.project_roots || {})[row.spec.project] || '';
+   const fetchLabel = isFetching ? '正在校验并拉取…' : (row.fetched ? '重新校验拉取' : '拉取到本地');
+   const rootTitle = boundRoot ? `当前绑定目录：${boundRoot}（点击修改）` : '设置该项目本地根目录';
+   actions = `<button class="primary" data-action="fetch-run" ${isFetching ? 'disabled' : ''}>${fetchLabel}</button> <button type="button" data-action="bind-fetch-root" title="${esc(rootTitle)}" ${isFetching ? 'disabled' : ''}>拉取目录…</button> ` + actions;
+  }
   if (['starting','running','stopping','lost'].includes(row.status) && row.spec.cooperative_stop) {
    actions = `<button data-action="stop" ${row.status === 'stopping' ? 'disabled' : ''}>请求安全停止</button> ` + actions;
   }
@@ -409,6 +421,73 @@ function openForm(task) {
 $('add-task').onclick=()=>openForm(); $('close-dialog').onclick=()=>$('task-dialog').close();
 $('connection').onclick=()=>{renderWatchList();$('watch-error').textContent='';$('watch-dialog').showModal();};
 $('close-watch-dialog').onclick=()=>$('watch-dialog').close();
+function openFetchDialog({attemptId: aid, project, suggested, sourceOutRel, bindOnly=false}) {
+ pendingFetch = {attemptId: aid, project, bindOnly};
+ $('fetch-dialog-title').textContent = bindOnly ? '修改本地项目根目录' : '绑定本地项目根目录';
+ $('fetch-project-label').textContent = `外部项目：${project}`;
+ $('fetch-root-input').value = suggested || (current.project_roots || {})[project] || '';
+ $('fetch-hint').textContent = sourceOutRel ? `归档内含相对路径 ${sourceOutRel}，请填写归档解压目标的项目根目录；后续同项目运行将直接沿用此目录。` : '请填写归档解压的目标根目录；后续同项目运行将直接沿用此目录。';
+ $('fetch-error').textContent = '';
+ $('fetch-submit').textContent = bindOnly ? '保存绑定' : '保存并拉取';
+ $('fetch-dialog').showModal();
+}
+async function executeFetch(aid, opts={}) {
+ if (!aid || fetchingIds.has(aid)) return;
+ fetchingIds.add(aid);
+ render();
+ try {
+  const res = await api('/api/fetch', {id: aid, ...opts});
+  if (res.needs_root) {
+   openFetchDialog({attemptId: aid, project: res.project, suggested: res.suggested_root, sourceOutRel: res.source_out_rel});
+   return;
+  }
+  if (res.conflict) {
+   const sample = (res.conflicts || []).slice(0, 5).join('\n');
+   const msg = `本地已有 ${res.conflict_count} 个同名文件且内容与归档不一致（将跳过 ${res.skipped_count} 个已校验一致文件）：\n${sample}${res.conflict_count > 5 ? '\n…' : ''}\n\n确认覆盖这些本地文件吗？`;
+   if (!confirm(msg)) {
+    notice('已取消拉取：保留本地已有文件，未覆盖冲突文件。');
+    return;
+   }
+   const over = await api('/api/fetch', {id: aid, ...opts, overwrite: true});
+   if (over.ok) {
+    notice(`SHA256 校验通过并已拉取到 ${over.dest}：新增 ${over.extracted_count}、覆盖 ${over.overwritten_count}、跳过 ${over.skipped_count}。`);
+    await refresh();
+   }
+   return;
+  }
+  if (res.ok) {
+   notice(`SHA256 校验通过并已拉取到 ${res.dest}：新增 ${res.extracted_count}、跳过已校验 ${res.skipped_count}。`);
+   await refresh();
+  }
+ } catch(error) {
+  notice(`拉取失败：${error.message}`);
+ } finally {
+  fetchingIds.delete(aid);
+  render();
+ }
+}
+$('close-fetch-dialog').onclick=()=>{pendingFetch=null;$('fetch-dialog').close();};
+$('fetch-form').onsubmit=async event=>{
+ event.preventDefault();
+ if (!pendingFetch) return;
+ const targetRoot = $('fetch-root-input').value.trim();
+ if (!targetRoot) { $('fetch-error').textContent = '请填写本地项目根目录'; return; }
+ const ctx = pendingFetch;
+ $('fetch-error').textContent = '';
+ try {
+  await api('/api/project-roots', {project: ctx.project, local_root: targetRoot});
+  pendingFetch = null;
+  $('fetch-dialog').close();
+  await refresh();
+  if (ctx.bindOnly) {
+   notice(`已将项目 ${ctx.project} 绑定到本地目录 ${targetRoot}。`);
+  } else {
+   await executeFetch(ctx.attemptId, {});
+  }
+ } catch(error) {
+  $('fetch-error').textContent = error.message;
+ }
+};
 $('watch-form').onsubmit=async event=>{
  event.preventDefault();
  try {
@@ -496,6 +575,12 @@ document.addEventListener('click',async event=>{
  try {
   if (action==='add') return openForm();
   if (action==='edit') return openForm(current.tasks.find(t=>t.id===taskId));
+  if (action==='fetch-run') return executeFetch(attemptId);
+  if (action==='bind-fetch-root') {
+   const row = selected();
+   if (row) openFetchDialog({attemptId: row.id, project: row.spec.project, suggested: (current.project_roots || {})[row.spec.project] || '', sourceOutRel: row.fetched?.source_out_rel || row.runtime?.source_out_rel || '', bindOnly: true});
+   return;
+  }
   button.disabled=true;
   if (action==='force' && !confirm('强制终止会清理本次任务进程树，可能丢失尚未保存的工作。确定继续？')) return;
   if (action==='start') selectAttempt((await api('/api/start',{task_id:taskId})).id);

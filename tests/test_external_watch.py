@@ -1,6 +1,8 @@
+import hashlib
 import json
 from pathlib import Path
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -309,6 +311,119 @@ class ExternalWatchTests(unittest.TestCase):
             self.assertEqual(self.request('/api/state')['watch_dirs'], [])
         finally:
             run.finish(status='completed', exit_code=0)
+
+    def test_external_archive_fetch_root_binding_incremental_and_conflict(self):
+        sync_root = self.watch.parent
+        runs_dir = sync_root / 'runs'
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        local_proj = self.watch.parent / 'LocalProj'
+        local_cwd = local_proj / 'experiments' / 'research'
+        local_cwd.mkdir(parents=True, exist_ok=True)
+
+        # Register a local task under the same project to verify automatic root suggestion.
+        self.request('/api/tasks', {
+            'name': 'Local Task',
+            'project': 'CloudFetchProj',
+            'cwd': str(local_cwd),
+            'argv': [sys.executable, '-V'],
+            'resume_argv': [],
+            'kind': 'experiment',
+        })
+
+        run = ExternalRun(
+            self.watch,
+            project='CloudFetchProj',
+            name='Remote Fetch Exp',
+            attempt_id='fetch_case_01',
+            task_id='fetch_task_1',
+            heartbeat_interval=30.0,
+            runtime={'archive_manifest': '../runs/fetch_case_01.manifest.json', 'source_out_rel': 'experiments/research/results/demo_out'},
+        ).start()
+
+        f1_rel = 'experiments/research/results/demo_out/evaluation.json'
+        f2_rel = 'experiments/research/results/demo_out/weights.bin'
+        f1_bytes = b'{"passed": true}\n'
+        f2_bytes = b'BIN_DATA_0123456789'
+
+        tar_path = runs_dir / 'fetch_case_01.tar'
+        import io
+        with tarfile.open(tar_path, 'w') as tf:
+            for arc, data in ((f1_rel, f1_bytes), (f2_rel, f2_bytes)):
+                info = tarfile.TarInfo(arc)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        tar_raw = tar_path.read_bytes()
+        manifest = {
+            'run_id': 'fetch_case_01',
+            'attempt_id': 'fetch_case_01',
+            'name': 'Remote Fetch Exp',
+            'project': 'CloudFetchProj',
+            'status': 'completed',
+            'tar_name': 'fetch_case_01.tar',
+            'tar_bytes': len(tar_raw),
+            'tar_sha256': hashlib.sha256(tar_raw).hexdigest(),
+            'source_out_rel': 'experiments/research/results/demo_out',
+            'file_count': 2,
+            'files': [
+                {'path': f1_rel, 'bytes': len(f1_bytes), 'sha256': hashlib.sha256(f1_bytes).hexdigest()},
+                {'path': f2_rel, 'bytes': len(f2_bytes), 'sha256': hashlib.sha256(f2_bytes).hexdigest()},
+            ],
+        }
+        (runs_dir / 'fetch_case_01.manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        run.finish(status='completed', exit_code=0)
+
+        snap = self.request('/api/state')
+        att = next(a for a in snap['attempts'] if a['id'] == 'ext_fetch_case_01')
+        self.assertTrue(att['archive_available'])
+        self.assertIsNone(att['fetched'])
+
+        # First pull without bound root returns needs_root and smart suggested_root.
+        ask = self.request('/api/fetch', {'id': 'ext_fetch_case_01'})
+        self.assertEqual(ask['ok'], False)
+        self.assertTrue(ask['needs_root'])
+        self.assertEqual(ask['project'], 'CloudFetchProj')
+        self.assertEqual(ask['suggested_root'], str(local_proj.resolve()))
+
+        # Pull with local_root binds it persistently and extracts both verified files.
+        res1 = self.request('/api/fetch', {'id': 'ext_fetch_case_01', 'local_root': str(local_proj)})
+        self.assertTrue(res1['ok'])
+        self.assertEqual(res1['extracted_count'], 2)
+        self.assertEqual(res1['skipped_count'], 0)
+        self.assertEqual((local_proj / f1_rel).read_bytes(), f1_bytes)
+        self.assertEqual((local_proj / f2_rel).read_bytes(), f2_bytes)
+
+        snap2 = self.request('/api/state')
+        self.assertEqual(snap2['project_roots']['CloudFetchProj'], str(local_proj.resolve()))
+        att2 = next(a for a in snap2['attempts'] if a['id'] == 'ext_fetch_case_01')
+        self.assertIsNotNone(att2['fetched'])
+        self.assertEqual(att2['fetched']['file_count'], 2)
+
+        # Second pull reuses persisted root and skips already-verified files.
+        res2 = self.request('/api/fetch', {'id': 'ext_fetch_case_01'})
+        self.assertTrue(res2['ok'])
+        self.assertEqual(res2['extracted_count'], 0)
+        self.assertEqual(res2['skipped_count'], 2)
+
+        # Mutating one local file yields conflict without overwriting until overwrite=True.
+        (local_proj / f1_rel).write_bytes(b'{"passed": false}\n')
+        conf = self.request('/api/fetch', {'id': 'ext_fetch_case_01'})
+        self.assertEqual(conf['ok'], False)
+        self.assertTrue(conf['conflict'])
+        self.assertEqual(conf['conflict_count'], 1)
+        self.assertEqual(conf['skipped_count'], 1)
+        self.assertEqual((local_proj / f1_rel).read_bytes(), b'{"passed": false}\n')
+
+        res_over = self.request('/api/fetch', {'id': 'ext_fetch_case_01', 'overwrite': True})
+        self.assertTrue(res_over['ok'])
+        self.assertEqual(res_over['overwritten_count'], 1)
+        self.assertEqual(res_over['skipped_count'], 1)
+        self.assertEqual((local_proj / f1_rel).read_bytes(), f1_bytes)
+
+        # Corrupt tar archive must fail verification with HTTP 400.
+        tar_path.write_bytes(tar_raw[:-4] + b'XXXX')
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            self.request('/api/fetch', {'id': 'ext_fetch_case_01'})
+        self.assertEqual(err.exception.code, 400)
 
 
 if __name__ == '__main__':

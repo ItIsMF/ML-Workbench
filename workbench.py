@@ -6,12 +6,13 @@ import json
 import math
 import mimetypes
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -287,6 +288,7 @@ def scan_external(watch_dirs, heartbeat_timeout=180.0):
                 'heartbeat_timeout': heartbeat_timeout,
                 'runtime': runtime,
                 'source_label': source_label,
+                'archive_available': _resolve_external_archive(sub, wdir, runtime) is not None,
             })
 
     ext_attempts.sort(key=lambda r: r['created'], reverse=True)
@@ -353,6 +355,299 @@ def _read_pref_list(db, key):
     except (ValueError, TypeError):
         return []
     return [x for x in items if isinstance(x, str) and x] if isinstance(items, list) else []
+
+
+def _read_pref_dict(db, key):
+    row = db.execute('SELECT value FROM preferences WHERE key=?', (key,)).fetchone()
+    if not row:
+        return {}
+    try:
+        obj = json.loads(row['value'])
+    except (ValueError, TypeError):
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_rel_posix(raw, dest_root):
+    if not isinstance(raw, str) or not raw or '\\' in raw:
+        raise ValueError(f'归档路径不合法：{raw!r}')
+    if raw in ('.', './'):
+        raise ValueError(f'归档路径不合法：{raw!r}')
+    posix = PurePosixPath(raw)
+    if posix.is_absolute() or '..' in posix.parts:
+        raise ValueError(f'归档路径包含越权片段：{raw!r}')
+    resolved_dest = Path(dest_root).resolve()
+    target = (resolved_dest / Path(*posix.parts)).resolve()
+    if not target.is_relative_to(resolved_dest):
+        raise ValueError(f'归档路径越出目标根目录：{raw!r}')
+    return posix
+
+
+def _validate_tar_member(member, dest_root):
+    raw = member.name
+    if '\\' in raw:
+        raise ValueError(f'归档成员包含非法反斜杠：{raw!r}')
+    if member.issym() or member.islnk():
+        raise ValueError(f'归档不允许包含符号链接或硬链接：{raw!r}')
+    stripped = raw
+    while stripped.startswith('./'):
+        stripped = stripped[2:]
+    if not stripped or stripped == '.':
+        return None
+    return _validate_rel_posix(stripped, dest_root)
+
+
+def _resolve_external_archive(attempt_dir, watch_dir, runtime):
+    wpath = Path(watch_dir).resolve()
+    sync_root = wpath.parent
+    adir = Path(attempt_dir).resolve()
+    candidates = []
+    rel_m = runtime.get('archive_manifest') if isinstance(runtime, dict) else None
+    if isinstance(rel_m, str):
+        rel_m = rel_m.strip()
+        if rel_m and '\0' not in rel_m and len(rel_m) <= 240:
+            candidates.append((wpath / rel_m).resolve())
+    m_name = runtime.get('run_archive_manifest') if isinstance(runtime, dict) else None
+    if isinstance(m_name, str) and SAFE_ID.fullmatch(m_name):
+        candidates.append((sync_root / 'runs' / m_name).resolve())
+    candidates.append((sync_root / 'runs' / f'{adir.name}.manifest.json').resolve())
+    for cand in candidates:
+        if cand.is_relative_to(sync_root) and cand.is_file():
+            return cand
+    return None
+
+
+def saved_project_roots(data):
+    with connect(data) as db:
+        raw = _read_pref_dict(db, 'project_roots')
+    return {
+        k: str(Path(v).resolve()) for k, v in raw.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+    }
+
+
+def set_project_root(data, project, local_root, *, require_existing=True):
+    if not isinstance(project, str) or not project.strip() or '\0' in project or len(project.strip()) > 120:
+        raise ValueError('无效项目名称')
+    proj = project.strip()
+    if not isinstance(local_root, str) or '\0' in local_root or len(local_root) > 500:
+        raise ValueError('本地项目根目录路径无效或过长')
+    text = local_root.strip()
+    resolved_str = ''
+    if text:
+        cand = Path(text).expanduser()
+        if not cand.is_absolute():
+            raise ValueError('本地项目根目录必须是现有的绝对目录')
+        resolved = cand.resolve()
+        if require_existing and not resolved.is_dir():
+            raise ValueError('本地项目根目录必须是现有的绝对目录')
+        resolved_str = str(resolved)
+    with connect(data) as db:
+        db.execute('BEGIN IMMEDIATE')
+        roots = {
+            k: v for k, v in _read_pref_dict(db, 'project_roots').items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+        }
+        if resolved_str:
+            roots[proj] = resolved_str
+        else:
+            roots.pop(proj, None)
+        db.execute('INSERT INTO preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   ('project_roots', json.dumps(roots, ensure_ascii=False)))
+    return {'ok': True, 'project': proj, 'local_root': resolved_str, 'project_roots': roots}
+
+
+def _suggest_project_root(local_tasks, project, source_out_rel=''):
+    p_clean = project.strip()
+    top_p = p_clean.split('/')[0].strip().lower()
+    parts = [s for s in str(source_out_rel or '').replace('\\', '/').split('/') if s and s != '.']
+    seg0 = parts[0] if len(parts) >= 2 else ''
+    exact = [t for t in local_tasks if not t.get('external') and str(t.get('project', '')).strip() == p_clean]
+    partial = [
+        t for t in local_tasks
+        if not t.get('external') and str(t.get('project', '')).split('/')[0].strip().lower() == top_p
+    ]
+    for task in (exact or partial):
+        raw_cwd = str(task.get('cwd') or '').strip()
+        if not raw_cwd:
+            continue
+        cpath = Path(raw_cwd).resolve()
+        if not cpath.is_dir():
+            continue
+        chain = [cpath, *cpath.parents]
+        for anc in chain:
+            if anc.name.lower() in (p_clean.lower(), top_p) and anc.is_dir():
+                return str(anc)
+        if seg0:
+            for anc in chain:
+                if (anc / seg0).is_dir() and anc.name.lower() != seg0.lower():
+                    return str(anc)
+        return str(cpath)
+    return ''
+
+
+def fetch_external_attempt(data, ident, *, local_root=None, overwrite=False, watch_dirs=(), heartbeat_timeout=180.0):
+    if not isinstance(ident, str) or not ident.startswith('ext_'):
+        raise ValueError('仅外部/云端运行支持拉取归档到本地')
+    row = resolve_attempt(data, ident, watch_dirs, heartbeat_timeout)
+    mpath = _resolve_external_archive(row['attempt_dir'], row['watch_dir'], row.get('runtime') or {})
+    if mpath is None:
+        raise ValueError('未找到该外部运行的归档清单')
+    try:
+        manifest = json.loads(mpath.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError) as err:
+        raise ValueError(f'归档清单读取失败：{err}') from err
+    if not isinstance(manifest, dict):
+        raise ValueError('归档清单格式无效')
+
+    tar_name = manifest.get('tar_name')
+    if not isinstance(tar_name, str) or not SAFE_ID.fullmatch(tar_name):
+        raise ValueError('归档清单缺少有效的 tar 文件名')
+    sync_root = Path(row['watch_dir']).resolve().parent
+    tar_path = (mpath.parent / tar_name).resolve()
+    if not tar_path.is_relative_to(sync_root) or not tar_path.is_file():
+        raise ValueError('未找到对应的归档 .tar 文件')
+
+    expected_tar_sha = manifest.get('tar_sha256')
+    if not isinstance(expected_tar_sha, str) or len(expected_tar_sha) != 64:
+        raise ValueError('归档清单缺少有效的 tar SHA256')
+    expected_tar_bytes = manifest.get('tar_bytes')
+    files_meta = manifest.get('files')
+    if not isinstance(files_meta, list) or not files_meta:
+        raise ValueError('归档清单缺少文件校验列表')
+
+    project_key = row['spec']['project'].strip()
+    if isinstance(local_root, str) and local_root.strip():
+        dest_str = set_project_root(data, project_key, local_root)['local_root']
+    else:
+        dest_str = saved_project_roots(data).get(project_key, '')
+        if not dest_str or not Path(dest_str).is_dir():
+            with connect(data) as db:
+                local_tasks = [dict(id=r['id'], **json.loads(r['spec'])) for r in db.execute('SELECT * FROM tasks ORDER BY rowid DESC')]
+            suggested = _suggest_project_root(local_tasks, project_key, manifest.get('source_out_rel', ''))
+            return {
+                'ok': False,
+                'needs_root': True,
+                'project': project_key,
+                'suggested_root': suggested,
+                'source_out_rel': str(manifest.get('source_out_rel') or ''),
+            }
+
+    dest_root = Path(dest_str).resolve()
+    expected_sha_by_rel = {}
+    skipped = []
+    conflicts = []
+    missing = []
+    for entry in files_meta:
+        if not isinstance(entry, dict):
+            raise ValueError('归档文件清单项格式无效')
+        posix = _validate_rel_posix(entry.get('path'), dest_root)
+        rel_str = posix.as_posix()
+        fsha = entry.get('sha256')
+        if not isinstance(fsha, str) or len(fsha) != 64:
+            raise ValueError(f'归档文件缺少有效 SHA256：{rel_str}')
+        expected_sha_by_rel[rel_str] = fsha
+        target = (dest_root / Path(*posix.parts)).resolve()
+        if target.is_file():
+            if _sha256_file(target) == fsha:
+                skipped.append(rel_str)
+            else:
+                conflicts.append(rel_str)
+        else:
+            missing.append(rel_str)
+
+    if expected_tar_bytes is not None and tar_path.stat().st_size != int(expected_tar_bytes):
+        raise ValueError('归档包大小或 SHA256 校验失败')
+    if _sha256_file(tar_path) != expected_tar_sha:
+        raise ValueError('归档包大小或 SHA256 校验失败')
+
+    if conflicts and not overwrite:
+        return {
+            'ok': False,
+            'conflict': True,
+            'dest': str(dest_root),
+            'source_out_rel': str(manifest.get('source_out_rel') or ''),
+            'conflicts': conflicts[:20],
+            'conflict_count': len(conflicts),
+            'skipped_count': len(skipped),
+            'missing_count': len(missing),
+        }
+
+    wanted = set(missing) | (set(conflicts) if overwrite else set())
+    if wanted:
+        seen = set()
+        with tarfile.open(tar_path, 'r:*') as tf:
+            for member in tf.getmembers():
+                rel = _validate_tar_member(member, dest_root)
+                if rel is None:
+                    continue
+                rel_str = rel.as_posix()
+                if not member.isreg() and not member.isdir():
+                    raise ValueError(f'归档包含不支持的成员类型：{member.name!r}')
+                if not member.isreg() or rel_str not in wanted:
+                    continue
+                src_stream = tf.extractfile(member)
+                if src_stream is None:
+                    raise ValueError(f'无法读取归档成员：{rel_str}')
+                target = (dest_root / Path(*rel.parts)).resolve()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.parent / f'{target.name}.tmp.{os.getpid()}.{secrets.token_hex(3)}'
+                digest = hashlib.sha256()
+                try:
+                    with src_stream, tmp.open('wb') as out_stream:
+                        while chunk := src_stream.read(65536):
+                            digest.update(chunk)
+                            out_stream.write(chunk)
+                    if digest.hexdigest() != expected_sha_by_rel[rel_str]:
+                        raise ValueError(f'解压文件 SHA256 校验失败：{rel_str}')
+                    os.replace(tmp, target)
+                    seen.add(rel_str)
+                finally:
+                    if tmp.exists():
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
+        if seen != wanted:
+            raise ValueError('归档包缺少清单声明的文件')
+
+    receipt = {
+        'dest': str(dest_root),
+        'source_out_rel': str(manifest.get('source_out_rel') or ''),
+        'file_count': len(files_meta),
+        'extracted_count': len(missing),
+        'overwritten_count': len(conflicts) if overwrite else 0,
+        'skipped_count': len(skipped),
+        'fetched_at': time.time(),
+    }
+    with connect(data) as db:
+        db.execute('BEGIN IMMEDIATE')
+        fetched_runs = {
+            k: v for k, v in _read_pref_dict(db, 'fetched_runs').items()
+            if isinstance(k, str) and isinstance(v, dict)
+        }
+        fetched_runs[ident] = receipt
+        if len(fetched_runs) > 200:
+            top_items = sorted(
+                fetched_runs.items(),
+                key=lambda kv: float(kv[1].get('fetched_at') or 0.0),
+                reverse=True,
+            )[:200]
+            fetched_runs = dict(top_items)
+        db.execute('INSERT INTO preferences VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                   ('fetched_runs', json.dumps(fetched_runs, ensure_ascii=False)))
+    return {'ok': True, **receipt}
 
 
 def _read_archived(db):
@@ -472,12 +767,18 @@ def state(data, watch_dirs=(), heartbeat_timeout=180.0):
         rows = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY created DESC LIMIT 100')]
         activity_rows = db.execute('SELECT task_id, MAX(created) AS last_created FROM attempts GROUP BY task_id').fetchall()
         archived = _read_archived(db)
+        project_roots = {
+            k: str(Path(v).resolve()) for k, v in _read_pref_dict(db, 'project_roots').items()
+            if isinstance(k, str) and isinstance(v, str) and v.strip()
+        }
+        fetched_runs = _read_pref_dict(db, 'fetched_runs')
     local_activity = {r['task_id']: float(r['last_created'] or 0.0) for r in activity_rows}
     for row in rows:
         row['spec'] = json.loads(row['spec'])
     ext_tasks, ext_attempts = scan_external(watch_dirs, heartbeat_timeout)
     ext_activity = {}
     for row in ext_attempts:
+        row['fetched'] = fetched_runs.get(row['id']) if isinstance(fetched_runs.get(row['id']), dict) else None
         tid = row['task_id']
         created = float(row.get('created') or 0.0)
         if created > ext_activity.get(tid, 0.0):
@@ -493,7 +794,8 @@ def state(data, watch_dirs=(), heartbeat_timeout=180.0):
         task['archived'] = (task['id'] in archived) and (task['id'] not in active_ids)
         task['last_activity'] = ext_activity.get(task['id'], 0.0)
     all_attempts = sorted(rows + ext_attempts, key=lambda r: r['created'], reverse=True)[:100]
-    return dict(tasks=tasks + ext_tasks, attempts=all_attempts, server_time=time.time(), watch_dirs=[str(p) for p in watch_dirs])
+    return dict(tasks=tasks + ext_tasks, attempts=all_attempts, server_time=time.time(),
+                watch_dirs=[str(p) for p in watch_dirs], project_roots=project_roots)
 
 
 def view_preferences(data, value=None):
@@ -727,6 +1029,16 @@ def make_server(data, port=8765, watch_dirs=None, heartbeat_timeout=180.0):
                     return self.respond({'ok': True})
                 if self.path == '/api/watch-dirs':
                     return self.respond(set_watch_dirs(data, value.get('watch_dirs')))
+                if self.path == '/api/project-roots':
+                    return self.respond(set_project_root(data, value.get('project'), value.get('local_root', '')))
+                if self.path == '/api/fetch':
+                    return self.respond(fetch_external_attempt(
+                        data, value.get('id'),
+                        local_root=value.get('local_root'),
+                        overwrite=value.get('overwrite') is True,
+                        watch_dirs=active_watch,
+                        heartbeat_timeout=heartbeat_timeout,
+                    ))
                 if self.path == '/api/tasks':
                     return self.respond({'id': save_task(data, value)})
                 if self.path == '/api/demo':
